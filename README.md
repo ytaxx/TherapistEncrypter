@@ -1,3 +1,5 @@
+![image](https://github.com/ytaxx/TherapistEncrypter/blob/main/therapist.png)
+
 # TherapistEncrypt
 
 > A compact, standalone C++ command-line utility providing a hardened, memory-hard encrypt/decrypt primitive and a small message mode. Designed for local file encryption and simple secure message storage.
