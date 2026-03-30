@@ -139,6 +139,7 @@ namespace therapist
     {
         std::array<std::uint8_t, 256> fwd;
         std::array<std::uint8_t, 256> inv;
+        std::array<std::array<std::uint64_t, 256>, 8> fwd64{}; // precomputed 64-bit lane tables
     };
 
     inline SBoxPair buildSBoxPair()
@@ -158,6 +159,15 @@ namespace therapist
         for (int i = 0; i < 256; ++i)
             p.inv[p.fwd[static_cast<std::size_t>(i)]] =
                 static_cast<std::uint8_t>(i);
+
+        // precompute 64-bit lane tables for faster substitution of 64-bit words
+        for (int lane = 0; lane < 8; ++lane)
+        {
+            const unsigned shift = static_cast<unsigned>(lane * 8U);
+            for (int b = 0; b < 256; ++b)
+                p.fwd64[static_cast<std::size_t>(lane)][static_cast<std::size_t>(b)] =
+                    static_cast<std::uint64_t>(p.fwd[static_cast<std::size_t>(b)]) << shift;
+        }
         return p;
     }
 
@@ -622,34 +632,76 @@ namespace therapist
         return s ? (v << s) | (v >> (64U - s)) : v;
     }
 
-    std::uint64_t load64LE(const std::uint8_t *d)
+    /* Platform helpers: efficient byte-swap and little-endian load/store */
+#if defined(_MSC_VER)
+#include <intrin.h>
+#pragma intrinsic(_byteswap_uint64)
+    static inline std::uint64_t bswap64(std::uint64_t x) { return _byteswap_uint64(x); }
+#elif defined(__GNUC__) || defined(__clang__)
+    static inline std::uint64_t bswap64(std::uint64_t x) { return __builtin_bswap64(x); }
+#else
+    static inline std::uint64_t bswap64(std::uint64_t x)
     {
-        std::uint64_t v = 0;
-        for (unsigned i = 0; i < 8U; ++i)
-            v |= static_cast<std::uint64_t>(d[i]) << (i * 8U);
+        return ((x & 0xFF00000000000000ULL) >> 56) |
+               ((x & 0x00FF000000000000ULL) >> 40) |
+               ((x & 0x0000FF0000000000ULL) >> 24) |
+               ((x & 0x000000FF00000000ULL) >> 8) |
+               ((x & 0x00000000FF000000ULL) << 8) |
+               ((x & 0x0000000000FF0000ULL) << 24) |
+               ((x & 0x000000000000FF00ULL) << 40) |
+               ((x & 0x00000000000000FFULL) << 56);
+    }
+#endif
+
+/* Detect common little-endian platforms; default to little-endian on MSVC/x86 */
+#if defined(_MSC_VER) || defined(__i386__) || defined(__x86_64__) || \
+    (defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+#define PLATFORM_LITTLE_ENDIAN 1
+#else
+#define PLATFORM_LITTLE_ENDIAN 0
+#endif
+
+    inline std::uint64_t load64LE(const std::uint8_t *d)
+    {
+        std::uint64_t v;
+        std::memcpy(&v, d, 8);
+#if PLATFORM_LITTLE_ENDIAN
         return v;
+#else
+        return bswap64(v);
+#endif
     }
 
-    void store64LE(std::uint8_t *d, std::uint64_t v)
+    inline void store64LE(std::uint8_t *d, std::uint64_t v)
     {
-        for (unsigned i = 0; i < 8U; ++i)
-            d[i] = static_cast<std::uint8_t>((v >> (i * 8U)) & 0xFFU);
+#if PLATFORM_LITTLE_ENDIAN
+        std::memcpy(d, &v, 8);
+#else
+        std::uint64_t t = bswap64(v);
+        std::memcpy(d, &t, 8);
+#endif
     }
 
     void incrementCounter(std::array<std::uint8_t, kBlockSize> &ctr)
     {
-        for (std::size_t i = 0; i < ctr.size(); ++i)
-            if (++ctr[i] != 0U) break;
+        // treat counter as two little-endian u64 words to increment with carry
+        std::uint64_t low = load64LE(ctr.data());
+        std::uint64_t high = load64LE(ctr.data() + 8);
+        ++low;
+        if (low == 0ULL) ++high;
+        store64LE(ctr.data(), low);
+        store64LE(ctr.data() + 8, high);
     }
 
     inline std::uint64_t applySBoxToWord(std::uint64_t w,
-                                         const std::array<std::uint8_t, 256> &sb)
+                                         const SBoxPair &sbp)
     {
+        // use precomputed 64-bit lane tables for faster substitution
         std::uint64_t r = 0;
         for (unsigned i = 0; i < 8U; ++i)
         {
             std::uint8_t b = static_cast<std::uint8_t>((w >> (i * 8U)) & 0xFFU);
-            r |= static_cast<std::uint64_t>(sb[b]) << (i * 8U);
+            r |= sbp.fwd64[i][static_cast<std::size_t>(b)];
         }
         return r;
     }
@@ -797,7 +849,17 @@ namespace therapist
             store64LE(ks_buf.data(), l);
             store64LE(ks_buf.data() + 8, r);
             std::size_t chunk = std::min<std::size_t>(kBlockSize, in.size() - off);
-            for (std::size_t i = 0; i < chunk; ++i)
+            // XOR in 64-bit chunks where possible for speed (safe on x86/ARM with memcpy)
+            const std::size_t full_words = chunk / 8;
+            for (std::size_t j = 0; j < full_words; ++j)
+            {
+                std::uint64_t win = 0, ksw = 0;
+                std::memcpy(&win, in.data() + off + j * 8, 8);
+                std::memcpy(&ksw, ks_buf.data() + j * 8, 8);
+                win ^= ksw;
+                std::memcpy(out.data() + off + j * 8, &win, 8);
+            }
+            for (std::size_t i = full_words * 8; i < chunk; ++i)
                 out[off + i] = static_cast<std::uint8_t>(in[off + i] ^ ks_buf[i]);
             incrementCounter(ctr);
             off += chunk;
@@ -912,34 +974,34 @@ namespace therapist
                 st[j] = rotl64(st[j], static_cast<unsigned>((j * 7 + 5) % 64));
             }
 
-        /* phase 2 — expand state into 1 MiB scratch buffer */
-        std::vector<std::uint8_t> mem(kKdfMemoryBytes);
+        /* phase 2 — expand state into 1 MiB scratch buffer (64-bit words) */
+        const std::size_t words = kKdfMemoryBytes / 8U;
+        std::vector<std::uint64_t> mem64(words);
         {
             std::size_t p = 0;
-            for (std::size_t i = 0; i + 8 <= kKdfMemoryBytes; i += 8)
+            for (std::size_t i = 0; i < words; ++i)
             {
                 st[p & 7U] = rotl64(st[p & 7U], 17U) ^ st[(p + 3U) & 7U];
                 st[p & 7U] += 0xC2B2AE3D27D4EB4FULL;
-                store64LE(&mem[i], st[p & 7U]);
+                mem64[i] = st[p & 7U];
                 ++p;
             }
         }
 
-        /* phase 3 — memory-hard mixing (131 072 iterations) */
+        /* phase 3 — memory-hard mixing (131 072 iterations) operating on 64-bit words */
         for (std::size_t iter = 0; iter < kKdfIterations; ++iter)
         {
-            std::size_t idx = static_cast<std::size_t>(
-                st[iter & 7U] % (kKdfMemoryBytes - 64U));
-            idx &= ~static_cast<std::size_t>(7U);  /* 8-byte align */
+            std::size_t idxw = static_cast<std::size_t>(
+                st[iter & 7U] % (words - 8U));
 
             for (int j = 0; j < 8; ++j)
             {
-                std::uint64_t mv = load64LE(&mem[idx + static_cast<std::size_t>(j) * 8U]);
+                std::uint64_t mv = mem64[idxw + static_cast<std::size_t>(j)];
                 st[j] ^= mv;
                 st[j] = rotl64(st[j],
                                static_cast<unsigned>((iter + static_cast<std::size_t>(j)) * 7U + 5U) % 64U);
                 st[j] += st[(j + 1) & 7] ^ 0x9E3779B97F4A7C15ULL;
-                store64LE(&mem[idx + static_cast<std::size_t>(j) * 8U], st[j]);
+                mem64[idxw + static_cast<std::size_t>(j)] = st[j];
             }
         }
 
@@ -971,9 +1033,9 @@ namespace therapist
             ks.macSeeds[i] = st[i];
         }
 
-        /* wipe scratch buffer */
-        volatile std::uint8_t *vp = mem.data();
-        for (std::size_t i = 0; i < mem.size(); ++i) vp[i] = 0;
+        /* wipe scratch buffer (mem64) */
+        volatile std::uint8_t *vp = reinterpret_cast<volatile std::uint8_t *>(mem64.data());
+        for (std::size_t i = 0; i < words * sizeof(std::uint64_t); ++i) vp[i] = 0;
 
         return ks;
     }
@@ -988,7 +1050,7 @@ namespace therapist
 
         /* first substitution pass */
         half ^= keyA;
-        half = applySBoxToWord(half, sb.fwd);
+        half = applySBoxToWord(half, sb);
 
         /* diffusion */
         half = rotl64(half, 19U);
@@ -998,7 +1060,7 @@ namespace therapist
         half ^= (half >> 33U);
 
         /* second substitution pass with key-dependent mixing */
-        half = applySBoxToWord(half ^ keyC, sb.fwd);
+        half = applySBoxToWord(half ^ keyC, sb);
 
         /* final avalanche */
         half = rotl64(half, 13U) ^ rotl64(half, 29U);
@@ -1084,7 +1146,16 @@ namespace therapist
             store64LE(ksBuf.data() + 8, r);
 
             std::size_t chunk = std::min<std::size_t>(kBlockSize, in.size() - off);
-            for (std::size_t i = 0; i < chunk; ++i)
+            const std::size_t full_words = chunk / 8;
+            for (std::size_t j = 0; j < full_words; ++j)
+            {
+                std::uint64_t win = 0, ksw = 0;
+                std::memcpy(&win, in.data() + off + j * 8, 8);
+                std::memcpy(&ksw, ksBuf.data() + j * 8, 8);
+                win ^= ksw;
+                std::memcpy(out.data() + off + j * 8, &win, 8);
+            }
+            for (std::size_t i = full_words * 8; i < chunk; ++i)
                 out[off + i] = static_cast<std::uint8_t>(in[off + i] ^ ksBuf[i]);
 
             incrementCounter(ctr);
@@ -1477,8 +1548,34 @@ namespace therapist
             oss << "unable to open input file: " << path;
             throw std::runtime_error(oss.str());
         }
-        return ByteVector{std::istreambuf_iterator<char>(input),
-                          std::istreambuf_iterator<char>()};
+
+        // Prefer sized read using seek/tell to avoid repeated reallocations
+        input.seekg(0, std::ios::end);
+        std::streamoff s = input.tellg();
+        if (s < 0)
+        {
+            // tellg failed (e.g., non-seekable stream) — fall back to iterator read
+            input.clear();
+            input.seekg(0, std::ios::beg);
+            return ByteVector{std::istreambuf_iterator<char>(input),
+                              std::istreambuf_iterator<char>()};
+        }
+
+        input.seekg(0, std::ios::beg);
+        std::size_t size = static_cast<std::size_t>(s);
+        ByteVector data;
+        data.resize(size);
+        if (size > 0)
+        {
+            input.read(reinterpret_cast<char *>(data.data()), static_cast<std::streamsize>(size));
+            if (static_cast<std::size_t>(input.gcount()) != size)
+            {
+                std::ostringstream oss;
+                oss << "failed to read input file: " << path;
+                throw std::runtime_error(oss.str());
+            }
+        }
+        return data;
     }
 
     void writeBinaryFile(const std::string &path, const ByteVector &data)
