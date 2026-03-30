@@ -7,6 +7,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <iterator>
 #include <numeric>
@@ -14,9 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <random>
-#ifndef _WIN32
 #include <thread>
-#endif
 #include <vector>
 #include <ctime>
 #include <iomanip>
@@ -211,6 +210,7 @@ namespace therapist
     constexpr std::size_t                 kChaffMinBytes  = 16;
     constexpr std::size_t                 kChaffMaxBytes  = 48;
     constexpr std::size_t                 kBlockSize      = 16;
+    constexpr std::size_t                 kStreamChunkSize = 65536; /* 64 KiB streaming chunk */
 
     /* ═══════════════════════════════════════════════════════════════════════
      *  ANTI-DEBUG
@@ -1246,6 +1246,380 @@ namespace therapist
         return mac;
     }
 
+    /* Streaming / incremental MAC helpers and streaming CTR cipher helpers */
+    namespace
+    {
+        constexpr std::uint64_t kMacPrimes[4] = {
+            0x100000001B3ULL,
+            0x1000000016FULL,
+            0x10000000233ULL,
+            0x10000000259ULL
+        };
+
+        inline void macFeedByte(Mac256 &mac, std::uint8_t byte)
+        {
+            for (int i = 0; i < 4; ++i)
+            {
+                mac.h[i] ^= byte;
+                mac.h[i] *= kMacPrimes[i];
+                mac.h[i] ^= (mac.h[i] >> 33U);
+            }
+            mac.h[0] ^= rotl64(mac.h[3], 7U);
+            mac.h[1] ^= rotl64(mac.h[0], 11U);
+            mac.h[2] ^= rotl64(mac.h[1], 17U);
+            mac.h[3] ^= rotl64(mac.h[2], 23U);
+        }
+
+        inline void macFeedBuffer(Mac256 &mac, const std::uint8_t *buf, std::size_t len)
+        {
+            for (std::size_t i = 0; i < len; ++i) macFeedByte(mac, buf[i]);
+        }
+
+        inline Mac256 macInit(const std::string &pass,
+                              const ByteVector &salt1,
+                              const ByteVector &salt2,
+                              std::uint32_t plainSize)
+        {
+            Mac256 mac;
+            mac.h[0] = 0xCBF29CE484222325ULL;
+            mac.h[1] = 0x6C62272E07BB0142ULL;
+            mac.h[2] = 0xAF63BD4C8601B7DFULL;
+            mac.h[3] = 0x340E1D2B2C67F689ULL;
+
+            // feed passphrase length (2 bytes)
+            macFeedByte(mac, static_cast<std::uint8_t>(pass.size() & 0xFFU));
+            macFeedByte(mac, static_cast<std::uint8_t>((pass.size() >> 8U) & 0xFFU));
+            // feed passphrase
+            for (unsigned char ch : pass) macFeedByte(mac, static_cast<std::uint8_t>(ch));
+            // feed salts and separators
+            for (std::uint8_t b : salt1) macFeedByte(mac, b);
+            macFeedByte(mac, 0xFFU);
+            for (std::uint8_t b : salt2) macFeedByte(mac, b);
+            macFeedByte(mac, 0xFEU);
+            // encode data length (4 bytes little-endian)
+            macFeedByte(mac, static_cast<std::uint8_t>(plainSize & 0xFFU));
+            macFeedByte(mac, static_cast<std::uint8_t>((plainSize >> 8U) & 0xFFU));
+            macFeedByte(mac, static_cast<std::uint8_t>((plainSize >> 16U) & 0xFFU));
+            macFeedByte(mac, static_cast<std::uint8_t>((plainSize >> 24U) & 0xFFU));
+
+            return mac;
+        }
+
+        inline void macFinalize(Mac256 &mac)
+        {
+            for (int round = 0; round < 8; ++round)
+                for (int i = 0; i < 4; ++i)
+                {
+                    mac.h[i] ^= rotl64(mac.h[(i + 1) & 3], 19U);
+                    mac.h[i] *= kMacPrimes[i];
+                    mac.h[i] ^= (mac.h[i] >> 29U);
+                }
+        }
+
+        inline std::array<std::uint8_t, kBlockSize> initCtrFromSalt(const ByteVector &salt)
+        {
+            std::array<std::uint8_t, kBlockSize> ctr{};
+            std::uint64_t sL = 0x6A09E667F3BCC909ULL;
+            std::uint64_t sR = 0xBB67AE8584CAA73BULL;
+            for (std::size_t i = 0; i < salt.size(); ++i)
+            {
+                sL ^= static_cast<std::uint64_t>(salt[i]) << ((i % 8U) * 8U);
+                sL = rotl64(sL, 9U);
+                sR ^= static_cast<std::uint64_t>(salt[i]) << (((i + 3U) % 8U) * 8U);
+                sR = rotl64(sR, 13U);
+            }
+            store64LE(ctr.data(), sL);
+            store64LE(ctr.data() + 8, sR);
+            return ctr;
+        }
+
+        void applyEnhancedCipherChunk(const std::uint8_t *in,
+                                       std::size_t inLen,
+                                       std::uint8_t *out,
+                                       const HardenedKeySchedule &ks,
+                                       std::array<std::uint8_t, kBlockSize> &ctr)
+        {
+            std::array<std::uint8_t, kBlockSize> ksBuf{};
+            std::size_t off = 0;
+            while (off < inLen)
+            {
+                std::uint64_t l = load64LE(ctr.data());
+                std::uint64_t r = load64LE(ctr.data() + 8);
+                encryptBlockV5(l, r, ks);
+                store64LE(ksBuf.data(), l);
+                store64LE(ksBuf.data() + 8, r);
+
+                std::size_t chunk = std::min<std::size_t>(kBlockSize, inLen - off);
+                const std::size_t full_words = chunk / 8;
+                for (std::size_t j = 0; j < full_words; ++j)
+                {
+                    std::uint64_t win = 0, ksw = 0;
+                    std::memcpy(&win, in + off + j * 8, 8);
+                    std::memcpy(&ksw, ksBuf.data() + j * 8, 8);
+                    win ^= ksw;
+                    std::memcpy(out + off + j * 8, &win, 8);
+                }
+                for (std::size_t i = full_words * 8; i < chunk; ++i)
+                    out[off + i] = static_cast<std::uint8_t>(in[off + i] ^ ksBuf[i]);
+
+                // increment counter
+                for (std::size_t i = 0; i < ctr.size(); ++i)
+                    if (++ctr[i] != 0U) break;
+
+                off += chunk;
+            }
+        }
+
+        void encryptFileStreamToFile(const std::string &inPath,
+                                     const std::string &outPath,
+                                     const std::string &passphrase)
+        {
+            std::ifstream fin(inPath, std::ios::binary);
+            if (!fin) throw std::runtime_error("unable to open input file: " + inPath);
+            fin.seekg(0, std::ios::end);
+            std::size_t plainSize = static_cast<std::size_t>(fin.tellg());
+            fin.seekg(0, std::ios::beg);
+
+            // generate salts and chaff
+            ByteVector salt1 = generateSalt(kSaltSizeV5);
+            ByteVector salt2 = generateSalt(kSaltSizeV5);
+            std::uint8_t rndByte[1];
+            fillCryptoRandom(rndByte, 1);
+            std::size_t chaffLen = kChaffMinBytes + (static_cast<std::size_t>(rndByte[0]) % (kChaffMaxBytes - kChaffMinBytes + 1));
+            ByteVector chaff(static_cast<std::size_t>(chaffLen));
+            fillCryptoRandom(chaff.data(), chaffLen);
+
+            // derive key schedules (sequential — portable)
+            HardenedKeySchedule ks1 = deriveHardenedSchedule(passphrase, salt1);
+            HardenedKeySchedule ks2 = deriveHardenedSchedule(passphrase, salt2);
+
+            // open output and write header (magic + ver + lengths + salts + placeholder mac)
+            std::ofstream fout(outPath, std::ios::binary | std::ios::trunc);
+            if (!fout) throw std::runtime_error("unable to open output file: " + outPath);
+
+            fout.write(reinterpret_cast<const char *>(kMagicV5.data()), static_cast<std::streamsize>(kMagicV5.size()));
+            fout.put(static_cast<char>(kVersionV5));
+            fout.put(static_cast<char>(static_cast<std::uint8_t>(kSaltSizeV5)));
+            fout.put(static_cast<char>(static_cast<std::uint8_t>(kMacSizeV5)));
+            fout.write(reinterpret_cast<const char *>(salt1.data()), static_cast<std::streamsize>(salt1.size()));
+            fout.write(reinterpret_cast<const char *>(salt2.data()), static_cast<std::streamsize>(salt2.size()));
+
+            std::streamoff macPos = static_cast<std::streamoff>(kMagicV5.size() + 3 + kSaltSizeV5 * 2);
+            // reserve mac bytes
+            std::vector<char> zeros(kMacSizeV5, 0);
+            fout.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
+
+            (void)0; // no-op: schedules already derived
+
+            // initial counters
+            auto ctr1 = initCtrFromSalt(salt1);
+            auto ctr2 = initCtrFromSalt(salt2);
+
+            // prepare MAC state
+            Mac256 mac = macInit(passphrase, salt1, salt2, static_cast<std::uint32_t>(plainSize));
+
+            // encrypt preamble (chaff length + chaff bytes)
+            std::vector<std::uint8_t> preamble;
+            preamble.reserve(2 + chaffLen);
+            preamble.push_back(static_cast<std::uint8_t>(chaffLen & 0xFFU));
+            preamble.push_back(static_cast<std::uint8_t>((chaffLen >> 8U) & 0xFFU));
+            preamble.insert(preamble.end(), chaff.begin(), chaff.end());
+
+            std::vector<std::uint8_t> tmp1(preamble.size()), tmp2(preamble.size());
+            applyEnhancedCipherChunk(preamble.data(), preamble.size(), tmp1.data(), ks1, ctr1);
+            applyEnhancedCipherChunk(tmp1.data(), tmp1.size(), tmp2.data(), ks2, ctr2);
+            fout.write(reinterpret_cast<const char *>(tmp2.data()), static_cast<std::streamsize>(tmp2.size()));
+
+            // stream plaintext
+            std::vector<std::uint8_t> inBuf(kStreamChunkSize);
+            std::vector<std::uint8_t> out1Buf(kStreamChunkSize);
+            std::vector<std::uint8_t> out2Buf(kStreamChunkSize);
+            while (fin)
+            {
+                fin.read(reinterpret_cast<char *>(inBuf.data()), static_cast<std::streamsize>(inBuf.size()));
+                std::streamsize got = fin.gcount();
+                if (got <= 0) break;
+                std::size_t gotu = static_cast<std::size_t>(got);
+
+                // feed MAC over plaintext bytes
+                macFeedBuffer(mac, inBuf.data(), gotu);
+
+                // first pass
+                applyEnhancedCipherChunk(inBuf.data(), gotu, out1Buf.data(), ks1, ctr1);
+                // second pass
+                applyEnhancedCipherChunk(out1Buf.data(), gotu, out2Buf.data(), ks2, ctr2);
+
+                fout.write(reinterpret_cast<const char *>(out2Buf.data()), static_cast<std::streamsize>(gotu));
+            }
+
+            // finalise MAC and write into header
+            macFinalize(mac);
+            // write mac as 4 x 8-byte big-endian
+            fout.seekp(macPos);
+            for (int i = 0; i < 4; ++i)
+                for (int shift = 56; shift >= 0; shift -= 8)
+                {
+                    unsigned char b = static_cast<unsigned char>((mac.h[i] >> shift) & 0xFFU);
+                    fout.put(static_cast<char>(b));
+                }
+
+            fout.flush();
+        }
+
+        void decryptFileStreamToFile(const std::string &inPath,
+                                     const std::string &outPath,
+                                     const std::string &passphrase)
+        {
+            std::ifstream fin(inPath, std::ios::binary);
+            if (!fin) throw std::runtime_error("unable to open input file: " + inPath);
+            fin.seekg(0, std::ios::end);
+            std::size_t fileSize = static_cast<std::size_t>(fin.tellg());
+            fin.seekg(0, std::ios::beg);
+
+            // read header
+            std::array<char, 4> magicBuf{};
+            fin.read(magicBuf.data(), 4);
+            if (!fin) throw std::runtime_error("failed to read header");
+            if (!std::equal(magicBuf.begin(), magicBuf.end(), reinterpret_cast<const char *>(kMagicV5.data())))
+                throw std::runtime_error("encrypted data header mismatch");
+            int version = fin.get();
+            if (version != kVersionV5) throw std::runtime_error("unsupported encrypted data version");
+            int saltLen = fin.get();
+            int macLen = fin.get();
+            if (saltLen <= 0 || macLen != static_cast<int>(kMacSizeV5))
+                throw std::runtime_error("corrupted encrypted data header");
+
+            ByteVector salt1(static_cast<std::size_t>(saltLen));
+            ByteVector salt2(static_cast<std::size_t>(saltLen));
+            fin.read(reinterpret_cast<char *>(salt1.data()), static_cast<std::streamsize>(salt1.size()));
+            fin.read(reinterpret_cast<char *>(salt2.data()), static_cast<std::streamsize>(salt2.size()));
+
+            Mac256 storedMac{};
+            for (int i = 0; i < 4; ++i)
+            {
+                storedMac.h[i] = 0;
+                for (int j = 0; j < 8; ++j)
+                {
+                    int ch = fin.get();
+                    if (ch == EOF) throw std::runtime_error("truncated mac in header");
+                    storedMac.h[i] = (storedMac.h[i] << 8U) | static_cast<std::uint64_t>(static_cast<unsigned char>(ch));
+                }
+            }
+
+            std::size_t hdrSize = static_cast<std::size_t>(kMagicV5.size() + 3 + saltLen * 2 + macLen);
+            std::size_t cipherSize = fileSize - hdrSize;
+
+            // derive both key schedules (sequential — portable)
+            HardenedKeySchedule ks1 = deriveHardenedSchedule(passphrase, salt1);
+            HardenedKeySchedule ks2 = deriveHardenedSchedule(passphrase, salt2);
+
+            // initial counters
+            auto ctr1 = initCtrFromSalt(salt1);
+            auto ctr2 = initCtrFromSalt(salt2);
+
+            // prepare output
+            std::ofstream fout(outPath, std::ios::binary | std::ios::trunc);
+            if (!fout) throw std::runtime_error("unable to open output file: " + outPath);
+
+            // stream decryption: read first chunk to extract chaff length
+            std::vector<std::uint8_t> inBuf(kStreamChunkSize);
+            std::vector<std::uint8_t> tmp1(kStreamChunkSize);
+            std::vector<std::uint8_t> tmp2(kStreamChunkSize);
+
+            // read and process first chunk
+            fin.read(reinterpret_cast<char *>(inBuf.data()), static_cast<std::streamsize>(inBuf.size()));
+            std::streamsize got = fin.gcount();
+            if (got <= 0) return; // nothing to do
+            std::size_t gotu = static_cast<std::size_t>(got);
+
+            // undo pass2 then pass1 on first chunk
+            applyEnhancedCipherChunk(inBuf.data(), gotu, tmp1.data(), ks2, ctr2);
+            applyEnhancedCipherChunk(tmp1.data(), gotu, tmp2.data(), ks1, ctr1);
+
+            // augmented size equals cipherSize
+            std::size_t augmentedSize = cipherSize;
+            if (gotu < 2)
+            {
+                // read until we have at least two decrypted bytes
+                std::vector<std::uint8_t> extra(2 - gotu);
+                fin.read(reinterpret_cast<char *>(extra.data()), static_cast<std::streamsize>(extra.size()));
+                std::streamsize got2 = fin.gcount();
+                if (got2 <= 0) throw std::runtime_error("truncated augmented header");
+                // decrypt additional bytes
+                std::size_t extrau = static_cast<std::size_t>(got2);
+                // process extra ciphertext
+                std::vector<std::uint8_t> tmpA(extrau);
+                fin.read(reinterpret_cast<char *>(inBuf.data()), static_cast<std::streamsize>(extrau));
+            }
+
+            // read chaff length from first two bytes
+            if (gotu < 2) throw std::runtime_error("failed to read chaff length");
+            std::size_t chaffLen = static_cast<std::size_t>(tmp2[0]) | (static_cast<std::size_t>(tmp2[1]) << 8U);
+            if (chaffLen < kChaffMinBytes || chaffLen > kChaffMaxBytes) throw std::runtime_error("invalid chaff length");
+
+            std::size_t plainSize = 0;
+            if (augmentedSize < 2 + chaffLen) throw std::runtime_error("corrupted augmented size");
+            plainSize = augmentedSize - 2 - chaffLen;
+
+            // initialize MAC with known plaintext size
+            Mac256 mac = macInit(passphrase, salt1, salt2, static_cast<std::uint32_t>(plainSize));
+
+            // handle initial decrypted bytes: skip 2 + chaffLen bytes from augmented
+            std::size_t skip = 2 + chaffLen;
+            std::size_t consumed = 0;
+            if (gotu > skip)
+            {
+                std::size_t plainPart = gotu - skip;
+                macFeedBuffer(mac, tmp2.data() + skip, plainPart);
+                fout.write(reinterpret_cast<const char *>(tmp2.data() + skip), static_cast<std::streamsize>(plainPart));
+                consumed = gotu;
+            }
+            else if (gotu <= skip)
+            {
+                // still in chaff area; nothing to write
+                consumed = gotu;
+            }
+
+            // continue streaming remaining ciphertext
+            while (fin)
+            {
+                fin.read(reinterpret_cast<char *>(inBuf.data()), static_cast<std::streamsize>(inBuf.size()));
+                std::streamsize g = fin.gcount();
+                if (g <= 0) break;
+                std::size_t gu = static_cast<std::size_t>(g);
+
+                applyEnhancedCipherChunk(inBuf.data(), gu, tmp1.data(), ks2, ctr2);
+                applyEnhancedCipherChunk(tmp1.data(), gu, tmp2.data(), ks1, ctr1);
+
+                // if we haven't finished skipping chaff, handle that
+                if (consumed < skip)
+                {
+                    std::size_t to_skip = std::min(skip - consumed, gu);
+                    if (to_skip < gu)
+                    {
+                        // some plaintext in this chunk
+                        std::size_t plainPart = gu - to_skip;
+                        macFeedBuffer(mac, tmp2.data() + to_skip, plainPart);
+                        fout.write(reinterpret_cast<const char *>(tmp2.data() + to_skip), static_cast<std::streamsize>(plainPart));
+                    }
+                    // else entirely chaff
+                    consumed += gu;
+                }
+                else
+                {
+                    // all plaintext
+                    macFeedBuffer(mac, tmp2.data(), gu);
+                    fout.write(reinterpret_cast<const char *>(tmp2.data()), static_cast<std::streamsize>(gu));
+                }
+            }
+
+            // finalise and compare MAC
+            macFinalize(mac);
+            if (!constantTimeMacEq(mac, storedMac))
+                throw std::runtime_error("authentication failed wrong passphrase or corrupted data");
+        }
+    }
+
     /* ═══════════════════════════════════════════════════════════════════════
      *  CHAFF random padding
      * ═══════════════════════════════════════════════════════════════════ */
@@ -2079,20 +2453,71 @@ int main(int argc, char *argv[])
             }
             else
             {
-                inputData = readBinaryFile(inputPath);
-                if (inputData.empty())
-                    std::cout << Color::warning
-                              << "warning: input file is empty the output "
-                                 "will also be empty"
+                // file mode: stream-processing to avoid loading entire file
+                const std::string resolvedInputPath = resolveRelativeToExe(exeDir, inputPath);
+                const std::string outputPath = buildOutputPath(inputPath, decryptMode);
+
+                hardenAgainstDebuggers();
+
+                // anti-debug probe: may produce a decoy output
+                if (debuggerProbeSignature(passphrase, decryptMode))
+                {
+                    // small probability case: produce decoy by reading file and writing fabricated decoy
+                    ByteVector fileBuf = readBinaryFile(resolvedInputPath);
+                    ByteVector decoy = fabricateDebuggerDecoy(fileBuf, decryptMode);
+                    writeBinaryFile(outputPath, decoy);
+                    std::cout << Color::success
+                              << (decryptMode ? "decrypted" : "encrypted")
+                              << " data written to: " << outputPath
                               << Color::reset << std::endl;
+                    if (interactiveMode)
+                    {
+                        waitForMenu();
+                        continue;
+                    }
+                    return finish(0);
+                }
+
+                // decision masking to decide encrypt vs decrypt lane
+                bool d1 = maskIntentDecision(decryptMode, passphrase);
+                bool d2 = maskIntentDecision(d1, passphrase);
+                bool executeDecrypt = false;
+                if (OPAQUE_TRUE(d1))
+                {
+                    if (d1 && d2) executeDecrypt = true;
+                    else if (d1 != d2) executeDecrypt = true;
+                    else executeDecrypt = false;
+                }
+
+                try
+                {
+                    if (executeDecrypt)
+                        decryptFileStreamToFile(resolvedInputPath, outputPath, passphrase);
+                    else
+                        encryptFileStreamToFile(resolvedInputPath, outputPath, passphrase);
+
+                    std::cout << Color::success
+                              << (executeDecrypt ? "decrypted" : "encrypted")
+                              << " data written to: " << outputPath
+                              << Color::reset << std::endl;
+
+                    if (interactiveMode)
+                    {
+                        waitForMenu();
+                        continue;
+                    }
+                    return finish(0);
+                }
+                catch (const std::exception &e)
+                {
+                    throw; // propagate to outer catch for reporting
+                }
             }
 
-            const bool decrypting =
-                messageMode ? messageDecrypt : decryptMode;
-
+            // message-mode continues in-memory: compute outputData
+            const bool decrypting = messageMode ? messageDecrypt : decryptMode;
             hardenAgainstDebuggers();
-            const auto outputData =
-                customTransform(inputData, passphrase, decrypting);
+            const auto outputData = customTransform(inputData, passphrase, decrypting);
 
             if (messageMode)
             {
