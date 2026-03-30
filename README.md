@@ -98,7 +98,7 @@ V4 (legacy) blobs are still accepted for decryption.
 - Add unit tests and CI including format tests and basic fuzzing. (not started)
 - Consider optional SIMD S-box (AVX2/NEON) fallback for heavy CPU workloads. (not started)
 
-If you'd like, I can implement the top-priority item (parallel CTR segmentation for multi-core throughput) next.
+If you'd like, I can implement the top-priority item (parallel CTR segmentation for multi-core throughput) next or maybe you could help me out with it.
 
 ## Contributing
 
