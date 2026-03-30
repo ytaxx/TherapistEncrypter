@@ -111,5 +111,27 @@ Notes on paths and output names:
 - If you want to improve the project, please open issues or PRs.
 - Suggested work: add unit tests for format parsing, verify MAC / KDF properties, and add optional integration with standard crypto libs for AEAD.
 
+**TODOS**
+
+**High priority**
+
+- Streamed, chunked I/O: change readBinaryFile/writeBinaryFile and the main pipeline to process fixed-size buffers rather than load entire files into memory — reduces memory use and enables pipelining for double-pass encryption. See main.cpp.
+- Parallelize KDF derivation: deriveHardenedSchedule is expensive and called twice for salt1/salt2 in encryptPayloadV5; run these two derivations concurrently to save wall-clock time. See main.cpp.
+- Pipeline double-pass encryption: create a two-stage pipeline (ks1 encrypt -> queue -> ks2 encrypt -> write) so you can stream and avoid storing full pass1. See encryptPayloadV5 / applyEnhancedCipher in main.cpp.
+
+**Medium priority**
+
+- Parallelize CTR-mode across block ranges: split ciphertext into N segments and compute keystream/XOR per thread (compute segment counter = base + (start/kBlockSize)). See applyEnhancedCipher in main.cpp.
+- Vectorize/word-wise MAC: change computeHardenedMac from byte-by-byte feed to word/64-bit processing to reduce loop overhead.
+- Expose KDF parameters: make kKdfIterations and kKdfMemoryBytes adjustable via CLI/env so users can trade speed vs hardness.
+
+**Lower priority**
+
+- Align KDF buffer and prefetch inner-loop reads; consider mlock/VirtualLock to keep scratch from swapping (requires privileges).
+- Implement SIMD S-box (AVX2/NEON) fallback for applySBoxToWord (highest speed on supported CPUs, but complex and needs careful testing).
+- Add microbenchmarks and CI (PGO/LTO build profiles) to measure improvements and integrate profiling runs.
+- Replace custom MAC with a standard fast MAC (BLAKE2b/HMAC) only if acceptable for protocol goals.
+- Add progress reporting for long operations and an option to run in lower-cost KDF mode for fast runs.
+
 **License**
 - MIT. License text is in [LICENSE](LICENSE).
