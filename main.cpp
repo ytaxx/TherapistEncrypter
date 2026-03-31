@@ -29,6 +29,7 @@
 #endif
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <malloc.h>
 #ifndef NTSTATUS
 using NTSTATUS = LONG;
 #endif
@@ -43,6 +44,7 @@ using NTSTATUS = LONG;
 #endif
 #else
 #include <dirent.h>
+#include <sys/mman.h>
 #endif
 
 
@@ -211,6 +213,29 @@ namespace therapist
     constexpr std::size_t                 kChaffMaxBytes  = 48;
     constexpr std::size_t                 kBlockSize      = 16;
     constexpr std::size_t                 kStreamChunkSize = 65536; /* 64 KiB streaming chunk */
+
+    // Runtime-tunable KDF parameters (can be overridden via env/CLI)
+    static std::size_t gKdfIterations = kKdfIterations;
+    static std::size_t gKdfMemoryBytes = kKdfMemoryBytes;
+
+    // Parse size strings like "1M", "64K", or decimal bytes. Returns false on parse error.
+    inline bool parseSizeWithSuffix(const std::string &s, std::size_t &out)
+    {
+        if (s.empty()) return false;
+        char last = s.back();
+        std::string num = s;
+        std::uint64_t mult = 1ULL;
+        if (last == 'K' || last == 'k') { mult = 1024ULL; num = s.substr(0, s.size() - 1); }
+        else if (last == 'M' || last == 'm') { mult = 1024ULL * 1024ULL; num = s.substr(0, s.size() - 1); }
+        else if (last == 'G' || last == 'g') { mult = 1024ULL * 1024ULL * 1024ULL; num = s.substr(0, s.size() - 1); }
+        try
+        {
+            std::size_t v = static_cast<std::size_t>(std::stoull(num));
+            out = static_cast<std::size_t>(v * mult);
+            return true;
+        }
+        catch (...) { return false; }
+    }
 
     /* ═══════════════════════════════════════════════════════════════════════
      *  ANTI-DEBUG
@@ -550,7 +575,7 @@ namespace therapist
      *  BANNER
      * ═══════════════════════════════════════════════════════════════════ */
     const std::array<std::string, 23> kBannerBase = {
-        u8"                   ⣤⣶⣶⣶⣶⣶⣦⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+        u8"                ⣤⣶⣶⣶⣶⣶⣦⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
         u8"⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢰⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⡄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
         u8"⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⢿⣿⣿⡿⣿⣿⣿⣿⣿⣿⣿⣿⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
         u8"⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣰⣿⣿⣿⣿⡇⣿⣷⣿⣿⣿⣿⣿⣿⣯⡄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀             therapist         ",
@@ -934,6 +959,59 @@ namespace therapist
         std::array<std::uint64_t, 4>  macSeeds{};
     };
 
+    // Portable helpers: aligned allocation, optional memory lock, and prefetch.
+    inline void *aligned_alloc_portable(std::size_t alignment, std::size_t size)
+    {
+        if (alignment < sizeof(void *)) alignment = sizeof(void *);
+        std::size_t total = size + alignment + sizeof(void *);
+        void *raw = std::malloc(total);
+        if (!raw) return nullptr;
+        std::uintptr_t rawp = reinterpret_cast<std::uintptr_t>(raw) + sizeof(void *);
+        std::uintptr_t aligned = (rawp + (alignment - 1)) & ~(alignment - 1);
+        void **store = reinterpret_cast<void **>(aligned - sizeof(void *));
+        *store = raw;
+        return reinterpret_cast<void *>(aligned);
+    }
+
+    inline void aligned_free_portable(void *p)
+    {
+        if (!p) return;
+        void **store = reinterpret_cast<void **>(reinterpret_cast<std::uintptr_t>(p) - sizeof(void *));
+        void *raw = *store;
+        std::free(raw);
+    }
+
+    inline bool lock_memory(void *p, std::size_t size)
+    {
+#if defined(_WIN32)
+        return VirtualLock(p, static_cast<SIZE_T>(size)) != 0;
+#else
+        return mlock(p, size) == 0;
+#endif
+    }
+
+    inline void unlock_memory(void *p, std::size_t size)
+    {
+#if defined(_WIN32)
+        VirtualUnlock(p, static_cast<SIZE_T>(size));
+#else
+        munlock(p, size);
+#endif
+    }
+
+#if defined(__GNUC__) || defined(__clang__)
+    inline void prefetch_range(const void *p, std::size_t size, std::size_t step = 64)
+    {
+        const char *c = static_cast<const char *>(p);
+        for (std::size_t off = 0; off < size; off += step)
+            __builtin_prefetch(c + off, 0, 3);
+    }
+#else
+    inline void prefetch_range(const void *, std::size_t, std::size_t = 64) {}
+#endif
+
+    // KDF: aligned scratch allocation, optional memory lock and prefetch
+    // are handled above; iterations/memory are configurable via CLI/env.
     /* memory-hard key stretching: 131 072 iterations over 1 MiB scratch */
     HardenedKeySchedule deriveHardenedSchedule(const std::string &pass,
                                                const ByteVector &salt)
@@ -974,9 +1052,19 @@ namespace therapist
                 st[j] = rotl64(st[j], static_cast<unsigned>((j * 7 + 5) % 64));
             }
 
-        /* phase 2 — expand state into 1 MiB scratch buffer (64-bit words) */
-        const std::size_t words = kKdfMemoryBytes / 8U;
-        std::vector<std::uint64_t> mem64(words);
+          /* phase 2 — expand state into scratch buffer (64-bit words)
+              memory size is configurable at runtime via `gKdfMemoryBytes` */
+          std::size_t memBytes = gKdfMemoryBytes;
+          // ensure multiple of 8 bytes (u64 words)
+          memBytes = (memBytes / 8U) * 8U;
+          constexpr std::size_t alignBytes = 64;
+          const std::size_t words = memBytes / 8U;
+          if (words <= 8U) throw std::invalid_argument("KDF memory too small");
+
+          // allocate cache-line aligned scratch
+          std::uint64_t *mem64 = static_cast<std::uint64_t *>(aligned_alloc_portable(alignBytes, memBytes));
+          if (!mem64) throw std::bad_alloc();
+
         {
             std::size_t p = 0;
             for (std::size_t i = 0; i < words; ++i)
@@ -988,8 +1076,20 @@ namespace therapist
             }
         }
 
-        /* phase 3 — memory-hard mixing (131 072 iterations) operating on 64-bit words */
-        for (std::size_t iter = 0; iter < kKdfIterations; ++iter)
+        // optional mlock/VirtualLock if user opts in via env
+        bool locked = false;
+        const char *lockEnv = std::getenv("THERAPIST_KDF_MLOCK");
+        if (lockEnv && lockEnv[0] != '\0')
+        {
+            // best-effort: don't fail KDF if locking not permitted
+            locked = lock_memory(mem64, memBytes);
+        }
+
+        // prefetch the scratch region to reduce page faults during mixing
+        prefetch_range(mem64, memBytes);
+
+        /* phase 3 — memory-hard mixing (configurable iterations) operating on 64-bit words */
+        for (std::size_t iter = 0; iter < gKdfIterations; ++iter)
         {
             std::size_t idxw = static_cast<std::size_t>(
                 st[iter & 7U] % (words - 8U));
@@ -1034,8 +1134,11 @@ namespace therapist
         }
 
         /* wipe scratch buffer (mem64) */
-        volatile std::uint8_t *vp = reinterpret_cast<volatile std::uint8_t *>(mem64.data());
-        for (std::size_t i = 0; i < words * sizeof(std::uint64_t); ++i) vp[i] = 0;
+        volatile std::uint8_t *vp = reinterpret_cast<volatile std::uint8_t *>(mem64);
+        for (std::size_t i = 0; i < memBytes; ++i) vp[i] = 0;
+
+        if (locked) unlock_memory(mem64, memBytes);
+        aligned_free_portable(mem64);
 
         return ks;
     }
@@ -1182,67 +1285,26 @@ namespace therapist
         return diff == 0;
     }
 
+    // Forward-declare the streaming helpers inside the anonymous namespace
+    namespace {
+        inline void macFeedBuffer(Mac256 &mac, const std::uint8_t *buf, std::size_t len);
+        inline Mac256 macInit(const std::string &pass,
+                              const ByteVector &salt1,
+                              const ByteVector &salt2,
+                              std::uint32_t plainSize);
+        inline void macFinalize(Mac256 &mac);
+    }
+
     Mac256 computeHardenedMac(const ByteVector &plain,
                               const std::string &pass,
                               const ByteVector &salt1,
                               const ByteVector &salt2)
     {
-        Mac256 mac;
-        mac.h[0] = 0xCBF29CE484222325ULL;
-        mac.h[1] = 0x6C62272E07BB0142ULL;
-        mac.h[2] = 0xAF63BD4C8601B7DFULL;
-        mac.h[3] = 0x340E1D2B2C67F689ULL;
-
-        constexpr std::uint64_t primes[4] = {
-            0x100000001B3ULL,
-            0x1000000016FULL,
-            0x10000000233ULL,
-            0x10000000259ULL
-        };
-
-        auto feed = [&](std::uint8_t byte)
-        {
-            for (int i = 0; i < 4; ++i)
-            {
-                mac.h[i] ^= byte;
-                mac.h[i] *= primes[i];
-                mac.h[i] ^= (mac.h[i] >> 33U);
-            }
-            /* cross-mix: each chain influences the next */
-            mac.h[0] ^= rotl64(mac.h[3], 7U);
-            mac.h[1] ^= rotl64(mac.h[0], 11U);
-            mac.h[2] ^= rotl64(mac.h[1], 17U);
-            mac.h[3] ^= rotl64(mac.h[2], 23U);
-        };
-
-        /* encode passphrase length */
-        feed(static_cast<std::uint8_t>(pass.size() & 0xFFU));
-        feed(static_cast<std::uint8_t>((pass.size() >> 8U) & 0xFFU));
-        /* feed passphrase */
-        for (unsigned char ch : pass)
-            feed(static_cast<std::uint8_t>(ch));
-        /* feed both salts */
-        for (std::uint8_t b : salt1) feed(b);
-        feed(0xFFU);  /* domain separator */
-        for (std::uint8_t b : salt2) feed(b);
-        feed(0xFEU);  /* domain separator */
-        /* encode data length */
-        feed(static_cast<std::uint8_t>(plain.size() & 0xFFU));
-        feed(static_cast<std::uint8_t>((plain.size() >> 8U) & 0xFFU));
-        feed(static_cast<std::uint8_t>((plain.size() >> 16U) & 0xFFU));
-        feed(static_cast<std::uint8_t>((plain.size() >> 24U) & 0xFFU));
-        /* feed plaintext */
-        for (std::uint8_t b : plain) feed(b);
-
-        /* finalise: extra mixing rounds */
-        for (int round = 0; round < 8; ++round)
-            for (int i = 0; i < 4; ++i)
-            {
-                mac.h[i] ^= rotl64(mac.h[(i + 1) & 3], 19U);
-                mac.h[i] *= primes[i];
-                mac.h[i] ^= (mac.h[i] >> 29U);
-            }
-
+        // Use the streaming helpers so that the buffer-fed path benefits
+        // from widened/word-wise processing implemented in macFeedBuffer.
+        Mac256 mac = macInit(pass, salt1, salt2, static_cast<std::uint32_t>(plain.size()));
+        if (!plain.empty()) macFeedBuffer(mac, plain.data(), plain.size());
+        macFinalize(mac);
         return mac;
     }
 
@@ -1272,7 +1334,68 @@ namespace therapist
 
         inline void macFeedBuffer(Mac256 &mac, const std::uint8_t *buf, std::size_t len)
         {
-            for (std::size_t i = 0; i < len; ++i) macFeedByte(mac, buf[i]);
+            // Word-wise processing: copy state to registers, process 8 bytes at a time
+            std::uint64_t h0 = mac.h[0];
+            std::uint64_t h1 = mac.h[1];
+            std::uint64_t h2 = mac.h[2];
+            std::uint64_t h3 = mac.h[3];
+
+            std::size_t i = 0;
+            // handle leading bytes until 8-byte alignment or small lengths
+            for (; i < len && ((reinterpret_cast<std::uintptr_t>(buf + i) & 7U) != 0U); ++i)
+            {
+                std::uint8_t b = buf[i];
+                h0 ^= b; h0 *= kMacPrimes[0]; h0 ^= (h0 >> 33U);
+                h1 ^= b; h1 *= kMacPrimes[1]; h1 ^= (h1 >> 33U);
+                h2 ^= b; h2 *= kMacPrimes[2]; h2 ^= (h2 >> 33U);
+                h3 ^= b; h3 *= kMacPrimes[3]; h3 ^= (h3 >> 33U);
+                h0 ^= rotl64(h3, 7U);
+                h1 ^= rotl64(h0, 11U);
+                h2 ^= rotl64(h1, 17U);
+                h3 ^= rotl64(h2, 23U);
+            }
+
+            // process full 64-bit words (8 bytes) at a time
+            const std::size_t words = (len - i) / 8U;
+            for (std::size_t w = 0; w < words; ++w)
+            {
+                std::uint64_t v = load64LE(buf + i + w * 8);
+                // unroll per-byte processing inside the 64-bit word
+                for (unsigned b = 0; b < 8; ++b)
+                {
+                    std::uint8_t byte = static_cast<std::uint8_t>((v >> (b * 8U)) & 0xFFU);
+                    h0 ^= byte; h0 *= kMacPrimes[0]; h0 ^= (h0 >> 33U);
+                    h1 ^= byte; h1 *= kMacPrimes[1]; h1 ^= (h1 >> 33U);
+                    h2 ^= byte; h2 *= kMacPrimes[2]; h2 ^= (h2 >> 33U);
+                    h3 ^= byte; h3 *= kMacPrimes[3]; h3 ^= (h3 >> 33U);
+                    h0 ^= rotl64(h3, 7U);
+                    h1 ^= rotl64(h0, 11U);
+                    h2 ^= rotl64(h1, 17U);
+                    h3 ^= rotl64(h2, 23U);
+                }
+            }
+            i += words * 8U;
+
+            // tail bytes
+            for (; i < len; ++i)
+            {
+                std::uint8_t b = buf[i];
+                h0 ^= b; h0 *= kMacPrimes[0]; h0 ^= (h0 >> 33U);
+                h1 ^= b; h1 *= kMacPrimes[1]; h1 ^= (h1 >> 33U);
+                h2 ^= b; h2 *= kMacPrimes[2]; h2 ^= (h2 >> 33U);
+                h3 ^= b; h3 *= kMacPrimes[3]; h3 ^= (h3 >> 33U);
+                h0 ^= rotl64(h3, 7U);
+                h1 ^= rotl64(h0, 11U);
+                h2 ^= rotl64(h1, 17U);
+                h3 ^= rotl64(h2, 23U);
+            }
+
+            mac.h[0] = h0;
+            mac.h[1] = h1;
+            mac.h[2] = h2;
+            mac.h[3] = h3;
+
+            // SIMD acceleration can be added later; scalar path kept for clarity.
         }
 
         inline Mac256 macInit(const std::string &pass,
@@ -2245,6 +2368,60 @@ int main(int argc, char *argv[])
     hardenAgainstDebuggers();
     const std::string exeDir = executableDirectory(argc, argv);
 
+    // --- parse KDF overrides from environment variables ---
+    if (const char *e = std::getenv("THERAPIST_KDF_ITERATIONS"))
+    {
+        try { std::size_t v = static_cast<std::size_t>(std::stoull(e)); if (v > 0) gKdfIterations = v; } catch (...) {}
+    }
+    if (const char *e = std::getenv("THERAPIST_KDF_MEMORY_BYTES"))
+    {
+        std::size_t v = 0;
+        if (parseSizeWithSuffix(std::string(e), v)) gKdfMemoryBytes = v;
+        else try { std::size_t vv = static_cast<std::size_t>(std::stoull(e)); if (vv > 0) gKdfMemoryBytes = vv; } catch (...) {}
+    }
+    if (const char *e2 = std::getenv("THERAPIST_KDF_MEMORY_MB"))
+    {
+        try { std::size_t mb = static_cast<std::size_t>(std::stoull(e2)); if (mb > 0) gKdfMemoryBytes = mb * 1024ULL * 1024ULL; } catch (...) {}
+    }
+
+    // --- parse CLI options (consume --kdf-iterations / --kdf-memory) ---
+    std::vector<std::string> residualArgs;
+    for (int i = 1; i < argc; ++i)
+    {
+        std::string a(argv[i]);
+        if (a.rfind("--kdf-iterations=", 0) == 0)
+        {
+            std::string val = a.substr(sizeof("--kdf-iterations=") - 1);
+            try { std::size_t v = static_cast<std::size_t>(std::stoull(val)); if (v > 0) gKdfIterations = v; } catch (...) {}
+            continue;
+        }
+        if (a == "--kdf-iterations")
+        {
+            if (i + 1 < argc) { try { std::size_t v = static_cast<std::size_t>(std::stoull(argv[++i])); if (v > 0) gKdfIterations = v; } catch (...) {} }
+            continue;
+        }
+        if (a.rfind("--kdf-memory=", 0) == 0)
+        {
+            std::string val = a.substr(sizeof("--kdf-memory=") - 1);
+            std::size_t v = 0;
+            if (parseSizeWithSuffix(val, v)) gKdfMemoryBytes = v;
+            else try { std::size_t vv = static_cast<std::size_t>(std::stoull(val)); if (vv > 0) gKdfMemoryBytes = vv; } catch (...) {}
+            continue;
+        }
+        if (a == "--kdf-memory")
+        {
+            if (i + 1 < argc)
+            {
+                std::string val(argv[++i]);
+                std::size_t v = 0;
+                if (parseSizeWithSuffix(val, v)) gKdfMemoryBytes = v;
+                else try { std::size_t vv = static_cast<std::size_t>(std::stoull(val)); if (vv > 0) gKdfMemoryBytes = vv; } catch (...) {}
+            }
+            continue;
+        }
+        residualArgs.push_back(a);
+    }
+
     while (true)
     {
         try
@@ -2259,17 +2436,17 @@ int main(int argc, char *argv[])
             std::string messageFilePath;
             std::string resolvedMessagePath;
 
-            if (!interactiveMode && argc == 3)
+            if (!interactiveMode && residualArgs.size() == 2)
             {
-                inputPath  = argv[1];
-                passphrase = argv[2];
+                inputPath  = residualArgs[0];
+                passphrase = residualArgs[1];
             }
-            else if (!interactiveMode && argc == 4 &&
-                     std::string(argv[1]) == "decrypt")
+            else if (!interactiveMode && residualArgs.size() == 3 &&
+                     residualArgs[0] == "decrypt")
             {
                 decryptMode = true;
-                inputPath   = argv[2];
-                passphrase  = argv[3];
+                inputPath   = residualArgs[1];
+                passphrase  = residualArgs[2];
             }
             else
             {
