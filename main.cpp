@@ -5,8 +5,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 #include <fstream>
 #include <functional>
+#include <memory>
 #include <future>
 #include <iostream>
 #include <iterator>
@@ -123,6 +125,12 @@ namespace therapist
 {
     using ByteVector = std::vector<std::uint8_t>;
     constexpr char kDefaultProgramName[] = "\xe2\x80\x8e ";
+    // Forward declarations used by streaming fallback helpers
+    ByteVector readBinaryFile(const std::string &path);
+    void writeBinaryFile(const std::string &path, const ByteVector &data);
+    ByteVector encryptPayloadAuto(const ByteVector &plain, const std::string &passphrase);
+    ByteVector decryptPayloadAuto(const ByteVector &input, const std::string &passphrase);
+    std::uint64_t currentTimeSeconds();
 
     /* ─── anti-tamper sentinel — if these constants are modified the cipher
        silently produces wrong output (no helpful error for an attacker)   ──- */
@@ -157,6 +165,8 @@ namespace therapist
             std::swap(p.fwd[static_cast<std::size_t>(i)],
                       p.fwd[static_cast<std::size_t>(j)]);
         }
+
+        
         for (int i = 0; i < 256; ++i)
             p.inv[p.fwd[static_cast<std::size_t>(i)]] =
                 static_cast<std::uint8_t>(i);
@@ -233,8 +243,17 @@ namespace therapist
             std::size_t v = static_cast<std::size_t>(std::stoull(num));
             out = static_cast<std::size_t>(v * mult);
             return true;
-        }
-        catch (...) { return false; }
+            }
+            catch (const std::exception &ex)
+            {
+                std::cerr << "self-test exception: " << ex.what() << std::endl;
+                return false;
+            }
+            catch (...)
+            {
+                std::cerr << "self-test unknown exception" << std::endl;
+                return false;
+            }
     }
 
     /* ═══════════════════════════════════════════════════════════════════════
@@ -960,6 +979,22 @@ namespace therapist
     };
 
     // Portable helpers: aligned allocation, optional memory lock, and prefetch.
+#if defined(_WIN32)
+    // Prefer MSVC native aligned allocator when available; otherwise fall back
+    // to a small portable manual allocator for other Windows toolchains.
+    #if defined(_MSC_VER)
+    inline void *aligned_alloc_portable(std::size_t alignment, std::size_t size)
+    {
+        if (alignment < sizeof(void *)) alignment = sizeof(void *);
+        return _aligned_malloc(size, alignment);
+    }
+
+    inline void aligned_free_portable(void *p)
+    {
+        if (!p) return;
+        _aligned_free(p);
+    }
+    #else
     inline void *aligned_alloc_portable(std::size_t alignment, std::size_t size)
     {
         if (alignment < sizeof(void *)) alignment = sizeof(void *);
@@ -980,6 +1015,81 @@ namespace therapist
         void *raw = *store;
         std::free(raw);
     }
+    #endif
+#else
+    inline void *aligned_alloc_portable(std::size_t alignment, std::size_t size)
+    {
+        if (alignment < sizeof(void *)) alignment = sizeof(void *);
+        void *p = nullptr;
+        if (posix_memalign(&p, alignment, size) != 0) return nullptr;
+        return p;
+    }
+
+    inline void aligned_free_portable(void *p)
+    {
+        free(p);
+    }
+#endif
+
+    // Secure zeroing helper - uses volatile write to avoid optimizer elision.
+    inline void secure_zero(void *p, std::size_t n)
+    {
+        if (!p || n == 0) return;
+        volatile std::uint8_t *vp = reinterpret_cast<volatile std::uint8_t *>(p);
+        for (std::size_t i = 0; i < n; ++i) vp[i] = 0;
+    }
+
+    inline void secure_wipe(ByteVector &v)
+    {
+        if (v.empty()) return;
+        secure_zero(v.data(), v.size());
+        v.clear();
+        v.shrink_to_fit();
+    }
+
+    inline void secure_wipe(std::string &s)
+    {
+        if (s.empty()) return;
+        secure_zero(&s[0], s.size());
+        s.clear();
+        s.shrink_to_fit();
+    }
+
+    // Forward-declare helpers used by RAII buffer (defined below).
+    inline bool lock_memory(void *p, std::size_t size);
+    inline void unlock_memory(void *p, std::size_t size);
+    inline void prefetch_range(const void *p, std::size_t size, std::size_t step);
+
+    // RAII wrapper for aligned scratch buffers that optionally locks memory
+    // and ensures zeroing and freeing on destruction.
+    struct ScopedAlignedBuffer
+    {
+        void *ptr{nullptr};
+        std::size_t size{0};
+        bool locked{false};
+
+        ScopedAlignedBuffer(std::size_t alignment, std::size_t bytes, bool tryLock = false)
+            : ptr(nullptr), size(bytes), locked(false)
+        {
+            ptr = aligned_alloc_portable(alignment, size);
+            if (!ptr) throw std::bad_alloc();
+            if (tryLock) locked = lock_memory(ptr, size);
+            prefetch_range(ptr, size, 64);
+        }
+
+        ~ScopedAlignedBuffer()
+        {
+            if (ptr)
+            {
+                secure_zero(ptr, size);
+                if (locked) unlock_memory(ptr, size);
+                aligned_free_portable(ptr);
+                ptr = nullptr;
+            }
+        }
+
+        void *data() const { return ptr; }
+    };
 
     inline bool lock_memory(void *p, std::size_t size)
     {
@@ -1058,12 +1168,16 @@ namespace therapist
           // ensure multiple of 8 bytes (u64 words)
           memBytes = (memBytes / 8U) * 8U;
           constexpr std::size_t alignBytes = 64;
+
+          const char *lockEnv = std::getenv("THERAPIST_KDF_MLOCK");
+          bool tryLock = lockEnv && lockEnv[0] != '\0';
+
+          // allocate cache-line aligned scratch via RAII wrapper
           const std::size_t words = memBytes / 8U;
           if (words <= 8U) throw std::invalid_argument("KDF memory too small");
 
-          // allocate cache-line aligned scratch
-          std::uint64_t *mem64 = static_cast<std::uint64_t *>(aligned_alloc_portable(alignBytes, memBytes));
-          if (!mem64) throw std::bad_alloc();
+          ScopedAlignedBuffer scratch(alignBytes, memBytes, tryLock);
+          std::uint64_t *mem64 = static_cast<std::uint64_t *>(scratch.data());
 
         {
             std::size_t p = 0;
@@ -1075,18 +1189,6 @@ namespace therapist
                 ++p;
             }
         }
-
-        // optional mlock/VirtualLock if user opts in via env
-        bool locked = false;
-        const char *lockEnv = std::getenv("THERAPIST_KDF_MLOCK");
-        if (lockEnv && lockEnv[0] != '\0')
-        {
-            // best-effort: don't fail KDF if locking not permitted
-            locked = lock_memory(mem64, memBytes);
-        }
-
-        // prefetch the scratch region to reduce page faults during mixing
-        prefetch_range(mem64, memBytes);
 
         /* phase 3 — memory-hard mixing (configurable iterations) operating on 64-bit words */
         for (std::size_t iter = 0; iter < gKdfIterations; ++iter)
@@ -1133,12 +1235,8 @@ namespace therapist
             ks.macSeeds[i] = st[i];
         }
 
-        /* wipe scratch buffer (mem64) */
-        volatile std::uint8_t *vp = reinterpret_cast<volatile std::uint8_t *>(mem64);
-        for (std::size_t i = 0; i < memBytes; ++i) vp[i] = 0;
-
-        if (locked) unlock_memory(mem64, memBytes);
-        aligned_free_portable(mem64);
+        /* wipe transient CPU state before returning */
+        for (std::size_t i = 0; i < st.size(); ++i) st[i] = 0;
 
         return ks;
     }
@@ -1311,6 +1409,20 @@ namespace therapist
     /* Streaming / incremental MAC helpers and streaming CTR cipher helpers */
     namespace
     {
+        // Forward declarations for stateful double-pass streaming helpers
+        // (placed inside this anonymous namespace so they match the
+        // definitions later in the same scope).
+        struct DoublePassStreamCtx;
+        inline void dpInit(DoublePassStreamCtx &ctx,
+                           const HardenedKeySchedule &ks1,
+                           const HardenedKeySchedule &ks2,
+                           const std::array<std::uint8_t, kBlockSize> &startCtr1,
+                           const std::array<std::uint8_t, kBlockSize> &startCtr2);
+        inline void dpProcess(DoublePassStreamCtx &ctx,
+                              const std::uint8_t *in,
+                              std::size_t inLen,
+                              std::uint8_t *out);
+
         constexpr std::uint64_t kMacPrimes[4] = {
             0x100000001B3ULL,
             0x1000000016FULL,
@@ -1472,6 +1584,8 @@ namespace therapist
                 store64LE(ksBuf.data(), l);
                 store64LE(ksBuf.data() + 8, r);
 
+                (void)0;
+
                 std::size_t chunk = std::min<std::size_t>(kBlockSize, inLen - off);
                 const std::size_t full_words = chunk / 8;
                 for (std::size_t j = 0; j < full_words; ++j)
@@ -1485,261 +1599,686 @@ namespace therapist
                 for (std::size_t i = full_words * 8; i < chunk; ++i)
                     out[off + i] = static_cast<std::uint8_t>(in[off + i] ^ ksBuf[i]);
 
-                // increment counter
-                for (std::size_t i = 0; i < ctr.size(); ++i)
-                    if (++ctr[i] != 0U) break;
+                // increment counter using the canonical helper to avoid
+                // subtle endianness/carry differences across implementations
+                incrementCounter(ctr);
 
                 off += chunk;
             }
+        }
+
+        
+
+        
+
+        // Stateful streaming context for double-pass CTR keystream so that
+        // partial-block calls across multiple process() invocations produce
+        // identical results to processing the concatenated data in one call.
+        struct DoublePassStreamCtx
+        {
+            const HardenedKeySchedule *ks1 = nullptr;
+            const HardenedKeySchedule *ks2 = nullptr;
+            std::array<std::uint8_t, kBlockSize> ctr1{};
+            std::array<std::uint8_t, kBlockSize> ctr2{};
+            std::array<std::uint8_t, kBlockSize> ks1Buf{};
+            std::array<std::uint8_t, kBlockSize> ks2Buf{};
+            std::size_t posInBlock = 0; // 0..kBlockSize-1: next byte index within current ks block
+        };
+
+        inline void dpInit(DoublePassStreamCtx &ctx,
+                           const HardenedKeySchedule &ks1,
+                           const HardenedKeySchedule &ks2,
+                           const std::array<std::uint8_t, kBlockSize> &startCtr1,
+                           const std::array<std::uint8_t, kBlockSize> &startCtr2)
+        {
+            ctx.ks1 = &ks1;
+            ctx.ks2 = &ks2;
+            ctx.ctr1 = startCtr1;
+            ctx.ctr2 = startCtr2;
+            ctx.posInBlock = 0;
+        }
+
+        inline void dpProcess(DoublePassStreamCtx &ctx,
+                              const std::uint8_t *in,
+                              std::size_t inLen,
+                              std::uint8_t *out)
+        {
+            std::size_t off = 0;
+            const char *dbg_env = std::getenv("THERAPIST_DEBUG_STREAM");
+            const bool dbg = dbg_env && dbg_env[0] != '\0';
+            if (dbg)
+            {
+                std::ostringstream s; s << "[info] dpProcess enter pos=" << ctx.posInBlock << " inLen=" << inLen << std::endl; std::cerr << s.str();
+            }
+
+            while (off < inLen)
+            {
+                if (ctx.posInBlock == 0)
+                {
+                    if (dbg)
+                    {
+                        std::ostringstream s;
+                        s << "[info] generate keystream block (inLen=" << inLen << ")\n";
+                        s << "[info] ctr1 before: ";
+                        for (std::size_t ii = 0; ii < kBlockSize; ++ii)
+                            s << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(ctx.ctr1[ii]);
+                        s << "\n[info] ctr2 before: ";
+                        for (std::size_t ii = 0; ii < kBlockSize; ++ii)
+                            s << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(ctx.ctr2[ii]);
+                        s << std::dec << std::endl;
+                        std::cerr << s.str();
+                    }
+
+                    // produce keystream block for ks1
+                    std::uint64_t l1 = load64LE(ctx.ctr1.data());
+                    std::uint64_t r1 = load64LE(ctx.ctr1.data() + 8);
+                    encryptBlockV5(l1, r1, *ctx.ks1);
+                    store64LE(ctx.ks1Buf.data(), l1);
+                    store64LE(ctx.ks1Buf.data() + 8, r1);
+
+                    // produce keystream block for ks2
+                    std::uint64_t l2 = load64LE(ctx.ctr2.data());
+                    std::uint64_t r2 = load64LE(ctx.ctr2.data() + 8);
+                    encryptBlockV5(l2, r2, *ctx.ks2);
+                    store64LE(ctx.ks2Buf.data(), l2);
+                    store64LE(ctx.ks2Buf.data() + 8, r2);
+
+                    if (dbg)
+                    {
+                        std::ostringstream s2;
+                        s2 << "[info] ks1: ";
+                        for (std::size_t ii = 0; ii < kBlockSize; ++ii)
+                            s2 << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(ctx.ks1Buf[ii]);
+                        s2 << "\n[info] ks2: ";
+                        for (std::size_t ii = 0; ii < kBlockSize; ++ii)
+                            s2 << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(ctx.ks2Buf[ii]);
+                        s2 << "\n[info] ks combined: ";
+                        for (std::size_t ii = 0; ii < kBlockSize; ++ii)
+                            s2 << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(ctx.ks1Buf[ii] ^ ctx.ks2Buf[ii]);
+                        s2 << std::dec << std::endl;
+                        std::cerr << s2.str();
+                    }
+
+                    // advance counters for next block
+                    incrementCounter(ctx.ctr1);
+                    incrementCounter(ctx.ctr2);
+
+                    if (dbg)
+                    {
+                        std::ostringstream s3;
+                        s3 << "[info] ctr1 after: ";
+                        for (std::size_t ii = 0; ii < kBlockSize; ++ii)
+                            s3 << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(ctx.ctr1[ii]);
+                        s3 << "\n[info] ctr2 after: ";
+                        for (std::size_t ii = 0; ii < kBlockSize; ++ii)
+                            s3 << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(ctx.ctr2[ii]);
+                        s3 << std::dec << std::endl;
+                        std::cerr << s3.str();
+                    }
+                }
+
+                std::size_t avail = kBlockSize - ctx.posInBlock;
+                std::size_t toCopy = std::min<std::size_t>(avail, inLen - off);
+                // XOR combined keystream
+                for (std::size_t i = 0; i < toCopy; ++i)
+                {
+                    out[off + i] = static_cast<std::uint8_t>(in[off + i] ^ (ctx.ks1Buf[ctx.posInBlock + i] ^ ctx.ks2Buf[ctx.posInBlock + i]));
+                }
+                if (dbg)
+                {
+                    std::ostringstream sx;
+                    sx << "[info] dpProcess chunk off=" << off << " toCopy=" << toCopy << " newPos=" << ((ctx.posInBlock + toCopy) % kBlockSize) << " out[:min(32)]= ";
+                    for (std::size_t ii = 0; ii < std::min<std::size_t>(toCopy, 32); ++ii)
+                        sx << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(out[off + ii]);
+                    sx << std::dec << std::endl;
+                    std::cerr << sx.str();
+                }
+                off += toCopy;
+                ctx.posInBlock = (ctx.posInBlock + toCopy) % kBlockSize;
+            }
+            if (dbg)
+            {
+                std::ostringstream sfin; sfin << "[info] dpProcess exit pos=" << ctx.posInBlock << std::endl; std::cerr << sfin.str();
+            }
+        }
+
+        // Combined double-pass CTR: generate keystream from ks1 and ks2
+        // and XOR together to produce final keystream. This avoids
+        // two-pass buffering and reduces chances of subtle ordering bugs.
+        void applyDoublePassCipherChunk(const std::uint8_t *in,
+                                        std::size_t inLen,
+                                        std::uint8_t *out,
+                                        const HardenedKeySchedule &ks1,
+                                        const HardenedKeySchedule &ks2,
+                                        std::array<std::uint8_t, kBlockSize> &ctr1,
+                                        std::array<std::uint8_t, kBlockSize> &ctr2)
+        {
+            // Reuse the canonical stateful streaming path to ensure identical
+            // semantics with dpProcess. This prevents subtle counter/posInBlock
+            // mismatches when callers split data into small chunks.
+            DoublePassStreamCtx tmpCtx;
+            dpInit(tmpCtx, ks1, ks2, ctr1, ctr2);
+            dpProcess(tmpCtx, in, inLen, out);
+            // copy back advanced counters
+            ctr1 = tmpCtx.ctr1;
+            ctr2 = tmpCtx.ctr2;
         }
 
         void encryptFileStreamToFile(const std::string &inPath,
                                      const std::string &outPath,
                                      const std::string &passphrase)
         {
-            std::ifstream fin(inPath, std::ios::binary);
-            if (!fin) throw std::runtime_error("unable to open input file: " + inPath);
-            fin.seekg(0, std::ios::end);
-            std::size_t plainSize = static_cast<std::size_t>(fin.tellg());
-            fin.seekg(0, std::ios::beg);
+            std::ifstream in(inPath, std::ios::binary);
+            if (!in)
+            {
+                std::ostringstream oss;
+                oss << "unable to open input file: " << inPath;
+                throw std::runtime_error(oss.str());
+            }
 
-            // generate salts and chaff
+            std::ofstream out(outPath, std::ios::binary | std::ios::trunc);
+            if (!out)
+            {
+                std::ostringstream oss;
+                oss << "unable to open output file: " << outPath;
+                throw std::runtime_error(oss.str());
+            }
+
+            // prepare header and salts
             ByteVector salt1 = generateSalt(kSaltSizeV5);
             ByteVector salt2 = generateSalt(kSaltSizeV5);
-            std::uint8_t rndByte[1];
-            fillCryptoRandom(rndByte, 1);
-            std::size_t chaffLen = kChaffMinBytes + (static_cast<std::size_t>(rndByte[0]) % (kChaffMaxBytes - kChaffMinBytes + 1));
-            ByteVector chaff(static_cast<std::size_t>(chaffLen));
-            fillCryptoRandom(chaff.data(), chaffLen);
 
-            // derive key schedules (sequential — portable)
-            HardenedKeySchedule ks1 = deriveHardenedSchedule(passphrase, salt1);
-            HardenedKeySchedule ks2 = deriveHardenedSchedule(passphrase, salt2);
+            // write header with placeholder MAC (we will seek-back to write real MAC)
+            out.write(reinterpret_cast<const char *>(kMagicV5.data()), static_cast<std::streamsize>(kMagicV5.size()));
+            out.put(static_cast<char>(kVersionV5));
+            out.put(static_cast<char>(static_cast<unsigned>(kSaltSizeV5)));
+            out.put(static_cast<char>(static_cast<unsigned>(kMacSizeV5)));
+            out.write(reinterpret_cast<const char *>(salt1.data()), static_cast<std::streamsize>(salt1.size()));
+            out.write(reinterpret_cast<const char *>(salt2.data()), static_cast<std::streamsize>(salt2.size()));
+            std::streampos macPos = out.tellp();
+            std::vector<std::uint8_t> zeroMac(static_cast<std::size_t>(kMacSizeV5), 0);
+            out.write(reinterpret_cast<const char *>(zeroMac.data()), static_cast<std::streamsize>(zeroMac.size()));
 
-            // open output and write header (magic + ver + lengths + salts + placeholder mac)
-            std::ofstream fout(outPath, std::ios::binary | std::ios::trunc);
-            if (!fout) throw std::runtime_error("unable to open output file: " + outPath);
+            // derive key schedules (may be expensive)
+            auto ks1 = deriveHardenedSchedule(passphrase, salt1);
+            auto ks2 = deriveHardenedSchedule(passphrase, salt2);
 
-            fout.write(reinterpret_cast<const char *>(kMagicV5.data()), static_cast<std::streamsize>(kMagicV5.size()));
-            fout.put(static_cast<char>(kVersionV5));
-            fout.put(static_cast<char>(static_cast<std::uint8_t>(kSaltSizeV5)));
-            fout.put(static_cast<char>(static_cast<std::uint8_t>(kMacSizeV5)));
-            fout.write(reinterpret_cast<const char *>(salt1.data()), static_cast<std::streamsize>(salt1.size()));
-            fout.write(reinterpret_cast<const char *>(salt2.data()), static_cast<std::streamsize>(salt2.size()));
+            // print a few schedule words for verification
+            {
+                std::ostringstream ss;
+                ss << "[info] ks1.rka[0..2]: ";
+                for (int i=0;i<3;++i) ss << std::hex << ks1.rka[i] << " ";
+                ss << " ks2.rka[0..2]: ";
+                for (int i=0;i<3;++i) ss << std::hex << ks2.rka[i] << " ";
+                ss << std::dec << std::endl;
+                std::cerr << ss.str();
+            }
 
-            std::streamoff macPos = static_cast<std::streamoff>(kMagicV5.size() + 3 + kSaltSizeV5 * 2);
-            // reserve mac bytes
-            std::vector<char> zeros(kMacSizeV5, 0);
-            fout.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
-
-            (void)0; // no-op: schedules already derived
-
-            // initial counters
+            // init counters from salts
             auto ctr1 = initCtrFromSalt(salt1);
             auto ctr2 = initCtrFromSalt(salt2);
 
-            // prepare MAC state
-            Mac256 mac = macInit(passphrase, salt1, salt2, static_cast<std::uint32_t>(plainSize));
-
-            // encrypt preamble (chaff length + chaff bytes)
-            std::vector<std::uint8_t> preamble;
-            preamble.reserve(2 + chaffLen);
-            preamble.push_back(static_cast<std::uint8_t>(chaffLen & 0xFFU));
-            preamble.push_back(static_cast<std::uint8_t>((chaffLen >> 8U) & 0xFFU));
-            preamble.insert(preamble.end(), chaff.begin(), chaff.end());
-
-            std::vector<std::uint8_t> tmp1(preamble.size()), tmp2(preamble.size());
-            applyEnhancedCipherChunk(preamble.data(), preamble.size(), tmp1.data(), ks1, ctr1);
-            applyEnhancedCipherChunk(tmp1.data(), tmp1.size(), tmp2.data(), ks2, ctr2);
-            fout.write(reinterpret_cast<const char *>(tmp2.data()), static_cast<std::streamsize>(tmp2.size()));
-
-            // stream plaintext
-            std::vector<std::uint8_t> inBuf(kStreamChunkSize);
-            std::vector<std::uint8_t> out1Buf(kStreamChunkSize);
-            std::vector<std::uint8_t> out2Buf(kStreamChunkSize);
-            while (fin)
+            // print initial counters
             {
-                fin.read(reinterpret_cast<char *>(inBuf.data()), static_cast<std::streamsize>(inBuf.size()));
-                std::streamsize got = fin.gcount();
-                if (got <= 0) break;
-                std::size_t gotu = static_cast<std::size_t>(got);
-
-                // feed MAC over plaintext bytes
-                macFeedBuffer(mac, inBuf.data(), gotu);
-
-                // first pass
-                applyEnhancedCipherChunk(inBuf.data(), gotu, out1Buf.data(), ks1, ctr1);
-                // second pass
-                applyEnhancedCipherChunk(out1Buf.data(), gotu, out2Buf.data(), ks2, ctr2);
-
-                fout.write(reinterpret_cast<const char *>(out2Buf.data()), static_cast<std::streamsize>(gotu));
+                auto printCtr = [](const std::array<std::uint8_t, kBlockSize> &c, const char *name)
+                {
+                    std::ostringstream ss;
+                    ss << "[info] " << name << " ctr: ";
+                    for (std::size_t i = 0; i < c.size(); ++i)
+                        ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(c[i]);
+                    ss << std::dec << std::endl;
+                    std::cerr << ss.str();
+                };
+                printCtr(ctr1, "enc ctr1");
+                printCtr(ctr2, "enc ctr2");
             }
 
-            // finalise MAC and write into header
+            // determine plaintext size (needed by MAC init). If not seekable, fall back to in-memory path.
+            in.seekg(0, std::ios::end);
+            std::streamoff s = in.tellg();
+            if (s < 0)
+            {
+                // non-seekable input — fall back to robust in-memory operation
+                in.clear();
+                in.seekg(0, std::ios::beg);
+                ByteVector data{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+                // wipe header placeholder and close out before writing via helper
+                out.close();
+                ByteVector outv = encryptPayloadAuto(data, passphrase);
+                writeBinaryFile(outPath, outv);
+                return;
+            }
+            const std::size_t plainSize = static_cast<std::size_t>(s);
+            in.seekg(0, std::ios::beg);
+
+            // initialize MAC with known plaintext size
+            Mac256 mac = macInit(passphrase, salt1, salt2, static_cast<std::uint32_t>(plainSize));
+
+            // generate chaff header+body
+            std::uint8_t one = 0;
+            fillCryptoRandom(&one, 1);
+            std::size_t chaffLen = kChaffMinBytes + (static_cast<std::size_t>(one) % (kChaffMaxBytes - kChaffMinBytes + 1));
+            ByteVector chaff;
+            if (chaffLen > 0)
+            {
+                chaff.resize(chaffLen);
+                fillCryptoRandom(chaff.data(), chaffLen);
+            }
+            std::uint8_t chaffHeader[2] = { static_cast<std::uint8_t>(chaffLen & 0xFFU), static_cast<std::uint8_t>((chaffLen >> 8U) & 0xFFU) };
+
+            // buffers
+            ByteVector inBuf;
+            inBuf.resize(kStreamChunkSize);
+            ByteVector midBuf;
+            midBuf.resize(kStreamChunkSize);
+            ByteVector outBuf;
+            outBuf.resize(kStreamChunkSize);
+
+            // small helper: stateful streaming double-pass processor
+            DoublePassStreamCtx streamCtx;
+            dpInit(streamCtx, ks1, ks2, ctr1, ctr2);
+            bool debugEncPrinted = false;
+            bool debugPlainPrinted = false;
+            auto pipelineEncrypt = [&](const std::uint8_t *data, std::size_t len)
+            {
+                std::size_t pos = 0;
+                while (pos < len)
+                {
+                    std::size_t chunk = std::min<std::size_t>(kStreamChunkSize, len - pos);
+                    if (outBuf.size() < chunk) outBuf.resize(chunk);
+                    dpProcess(streamCtx, data + pos, chunk, outBuf.data());
+                    if (!debugEncPrinted)
+                    {
+                        std::ostringstream s;
+                        s << "[info] encrypt first chunk out: ";
+                        for (std::size_t i = 0; i < std::min<std::size_t>(chunk, 32); ++i)
+                            s << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(outBuf[i]);
+                        s << std::dec << std::endl;
+                        std::cerr << s.str();
+                        debugEncPrinted = true;
+                    }
+                    out.write(reinterpret_cast<const char *>(outBuf.data()), static_cast<std::streamsize>(chunk));
+                    if (!out) throw std::runtime_error("failed to write encrypted data");
+                    pos += chunk;
+                }
+            };
+
+            // write chaff header and body first (not part of MAC)
+            pipelineEncrypt(chaffHeader, 2);
+            if (chaffLen > 0) pipelineEncrypt(chaff.data(), chaffLen);
+
+            // counters after chaff
+            {
+                auto printCtr = [](const std::array<std::uint8_t, kBlockSize> &c, const char *name)
+                {
+                    std::ostringstream ss;
+                    ss << "[info] " << name << " after chaff: ";
+                    for (std::size_t i = 0; i < c.size(); ++i)
+                        ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(c[i]);
+                    ss << std::dec << std::endl;
+                    std::cerr << ss.str();
+                };
+                printCtr(ctr1, "enc ctr1");
+                printCtr(ctr2, "enc ctr2");
+            }
+
+            // stream plaintext: update MAC and encrypt
+            while (in)
+            {
+                in.read(reinterpret_cast<char *>(inBuf.data()), static_cast<std::streamsize>(inBuf.size()));
+                std::streamsize got = in.gcount();
+                if (got <= 0) break;
+                const std::size_t got_sz = static_cast<std::size_t>(got);
+                if (!debugPlainPrinted)
+                {
+                    std::ostringstream s;
+                    s << "[info] plaintext first chunk: ";
+                    for (std::size_t i = 0; i < std::min<std::size_t>(got_sz, 32); ++i)
+                        s << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(inBuf[i]);
+                    s << std::dec << std::endl;
+                    std::cerr << s.str();
+                    debugPlainPrinted = true;
+                }
+                // feed MAC with plaintext
+                macFeedBuffer(mac, inBuf.data(), got_sz);
+                // encrypt and write
+                if (midBuf.size() < got_sz) midBuf.resize(got_sz);
+                if (outBuf.size() < got_sz) outBuf.resize(got_sz);
+                dpProcess(streamCtx, inBuf.data(), got_sz, outBuf.data());
+                out.write(reinterpret_cast<const char *>(outBuf.data()), static_cast<std::streamsize>(got_sz));
+                if (!out) throw std::runtime_error("failed to write encrypted data");
+                // counters after writing this plaintext chunk
+                if (!debugPlainPrinted)
+                {
+                    auto printCtr = [](const std::array<std::uint8_t, kBlockSize> &c, const char *name)
+                    {
+                        std::ostringstream ss;
+                        ss << "[info] " << name << " after first plain chunk: ";
+                        for (std::size_t i = 0; i < c.size(); ++i)
+                            ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(c[i]);
+                        ss << std::dec << std::endl;
+                        std::cerr << ss.str();
+                    };
+                    printCtr(ctr1, "enc ctr1");
+                    printCtr(ctr2, "enc ctr2");
+                }
+            }
+
+            // finalize mac and write into header position
             macFinalize(mac);
-            // write mac as 4 x 8-byte big-endian
-            fout.seekp(macPos);
+            // print computed MAC (hex)
+            {
+                std::ostringstream oss;
+                oss << "[info] encrypt mac: ";
+                for (int ii = 0; ii < 4; ++ii)
+                {
+                    oss << std::hex << std::setfill('0');
+                    for (int shift = 56; shift >= 0; shift -= 8)
+                        oss << std::setw(2) << static_cast<int>((mac.h[ii] >> shift) & 0xFFU);
+                }
+                std::cerr << oss.str() << std::dec << std::endl;
+            }
+            out.flush();
+            out.seekp(macPos);
+            if (!out) throw std::runtime_error("failed to seek output file to write MAC");
             for (int i = 0; i < 4; ++i)
                 for (int shift = 56; shift >= 0; shift -= 8)
-                {
-                    unsigned char b = static_cast<unsigned char>((mac.h[i] >> shift) & 0xFFU);
-                    fout.put(static_cast<char>(b));
-                }
+                    out.put(static_cast<char>((mac.h[i] >> shift) & 0xFFU));
+            out.flush();
 
-            fout.flush();
+            // wipe key schedules from stack
+            volatile std::uint8_t *p1 = reinterpret_cast<volatile std::uint8_t *>(&ks1);
+            for (std::size_t i = 0; i < sizeof(ks1); ++i) p1[i] = 0;
+            volatile std::uint8_t *p2 = reinterpret_cast<volatile std::uint8_t *>(&ks2);
+            for (std::size_t i = 0; i < sizeof(ks2); ++i) p2[i] = 0;
+
+            out.close();
+            in.close();
         }
 
         void decryptFileStreamToFile(const std::string &inPath,
                                      const std::string &outPath,
                                      const std::string &passphrase)
         {
-            std::ifstream fin(inPath, std::ios::binary);
-            if (!fin) throw std::runtime_error("unable to open input file: " + inPath);
-            fin.seekg(0, std::ios::end);
-            std::size_t fileSize = static_cast<std::size_t>(fin.tellg());
-            fin.seekg(0, std::ios::beg);
+            std::ifstream in(inPath, std::ios::binary);
+            if (!in)
+            {
+                std::ostringstream oss;
+                oss << "unable to open input file: " << inPath;
+                throw std::runtime_error(oss.str());
+            }
 
-            // read header
-            std::array<char, 4> magicBuf{};
-            fin.read(magicBuf.data(), 4);
-            if (!fin) throw std::runtime_error("failed to read header");
-            if (!std::equal(magicBuf.begin(), magicBuf.end(), reinterpret_cast<const char *>(kMagicV5.data())))
+            // read and parse header (baseHdr + salts + mac)
+            const std::size_t baseHdr = kMagicV5.size() + 3;
+            std::array<char, 7> hdr{};
+            in.read(hdr.data(), static_cast<std::streamsize>(hdr.size()));
+            if (static_cast<std::size_t>(in.gcount()) != hdr.size())
+                throw std::invalid_argument("encrypted data is too short");
+            if (!std::equal(kMagicV5.begin(), kMagicV5.end(), reinterpret_cast<const std::uint8_t *>(hdr.data())))
                 throw std::runtime_error("encrypted data header mismatch");
-            int version = fin.get();
-            if (version != kVersionV5) throw std::runtime_error("unsupported encrypted data version");
-            int saltLen = fin.get();
-            int macLen = fin.get();
-            if (saltLen <= 0 || macLen != static_cast<int>(kMacSizeV5))
+            if (static_cast<unsigned char>(hdr[kMagicV5.size()]) != kVersionV5)
+                throw std::runtime_error("unsupported encrypted data version");
+
+            std::uint8_t saltLen = static_cast<std::uint8_t>(hdr[kMagicV5.size() + 1]);
+            std::uint8_t macLen  = static_cast<std::uint8_t>(hdr[kMagicV5.size() + 2]);
+            if (saltLen == 0 || macLen == 0 || macLen != kMacSizeV5)
                 throw std::runtime_error("corrupted encrypted data header");
 
+            // read salts and stored MAC
             ByteVector salt1(static_cast<std::size_t>(saltLen));
             ByteVector salt2(static_cast<std::size_t>(saltLen));
-            fin.read(reinterpret_cast<char *>(salt1.data()), static_cast<std::streamsize>(salt1.size()));
-            fin.read(reinterpret_cast<char *>(salt2.data()), static_cast<std::streamsize>(salt2.size()));
-
+            in.read(reinterpret_cast<char *>(salt1.data()), static_cast<std::streamsize>(salt1.size()));
+            in.read(reinterpret_cast<char *>(salt2.data()), static_cast<std::streamsize>(salt2.size()));
             Mac256 storedMac{};
+            ByteVector macBytes(static_cast<std::size_t>(macLen));
+            in.read(reinterpret_cast<char *>(macBytes.data()), static_cast<std::streamsize>(macBytes.size()));
+            if (static_cast<std::size_t>(in.gcount()) != macBytes.size())
+                throw std::runtime_error("encrypted data truncated while reading MAC");
+            // decode big-endian mac
             for (int i = 0; i < 4; ++i)
             {
                 storedMac.h[i] = 0;
                 for (int j = 0; j < 8; ++j)
-                {
-                    int ch = fin.get();
-                    if (ch == EOF) throw std::runtime_error("truncated mac in header");
-                    storedMac.h[i] = (storedMac.h[i] << 8U) | static_cast<std::uint64_t>(static_cast<unsigned char>(ch));
-                }
+                    storedMac.h[i] = (storedMac.h[i] << 8U) |
+                                     static_cast<std::uint64_t>(macBytes[static_cast<std::size_t>(i) * 8U + static_cast<std::size_t>(j)]);
             }
 
-            std::size_t hdrSize = static_cast<std::size_t>(kMagicV5.size() + 3 + saltLen * 2 + macLen);
-            std::size_t cipherSize = fileSize - hdrSize;
+            // derive schedules
+            auto ks2 = deriveHardenedSchedule(passphrase, salt2);
+            auto ks1 = deriveHardenedSchedule(passphrase, salt1);
 
-            // derive both key schedules (sequential — portable)
-            HardenedKeySchedule ks1 = deriveHardenedSchedule(passphrase, salt1);
-            HardenedKeySchedule ks2 = deriveHardenedSchedule(passphrase, salt2);
+            // print a few schedule words for verification
+            {
+                std::ostringstream ss;
+                ss << "[info] ks1.rka[0..2]: ";
+                for (int i=0;i<3;++i) ss << std::hex << ks1.rka[i] << " ";
+                ss << " ks2.rka[0..2]: ";
+                for (int i=0;i<3;++i) ss << std::hex << ks2.rka[i] << " ";
+                ss << std::dec << std::endl;
+                std::cerr << ss.str();
+            }
 
-            // initial counters
-            auto ctr1 = initCtrFromSalt(salt1);
             auto ctr2 = initCtrFromSalt(salt2);
+            auto ctr1 = initCtrFromSalt(salt1);
 
-            // prepare output
-            std::ofstream fout(outPath, std::ios::binary | std::ios::trunc);
-            if (!fout) throw std::runtime_error("unable to open output file: " + outPath);
+            // initialize streaming double-pass context
+            DoublePassStreamCtx streamCtx;
+            dpInit(streamCtx, ks1, ks2, ctr1, ctr2);
 
-            // stream decryption: read first chunk to extract chaff length
-            std::vector<std::uint8_t> inBuf(kStreamChunkSize);
-            std::vector<std::uint8_t> tmp1(kStreamChunkSize);
-            std::vector<std::uint8_t> tmp2(kStreamChunkSize);
-
-            // read and process first chunk
-            fin.read(reinterpret_cast<char *>(inBuf.data()), static_cast<std::streamsize>(inBuf.size()));
-            std::streamsize got = fin.gcount();
-            if (got <= 0) return; // nothing to do
-            std::size_t gotu = static_cast<std::size_t>(got);
-
-            // undo pass2 then pass1 on first chunk
-            applyEnhancedCipherChunk(inBuf.data(), gotu, tmp1.data(), ks2, ctr2);
-            applyEnhancedCipherChunk(tmp1.data(), gotu, tmp2.data(), ks1, ctr1);
-
-            // augmented size equals cipherSize
-            std::size_t augmentedSize = cipherSize;
-            if (gotu < 2)
+            // print initial decrypt counters
             {
-                // read until we have at least two decrypted bytes
-                std::vector<std::uint8_t> extra(2 - gotu);
-                fin.read(reinterpret_cast<char *>(extra.data()), static_cast<std::streamsize>(extra.size()));
-                std::streamsize got2 = fin.gcount();
-                if (got2 <= 0) throw std::runtime_error("truncated augmented header");
-                // decrypt additional bytes
-                std::size_t extrau = static_cast<std::size_t>(got2);
-                // process extra ciphertext
-                std::vector<std::uint8_t> tmpA(extrau);
-                fin.read(reinterpret_cast<char *>(inBuf.data()), static_cast<std::streamsize>(extrau));
+                auto printCtr = [](const std::array<std::uint8_t, kBlockSize> &c, const char *name)
+                {
+                    std::ostringstream ss;
+                    ss << "[info] " << name << " ctr: ";
+                    for (std::size_t i = 0; i < c.size(); ++i)
+                        ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(c[i]);
+                    ss << std::dec << std::endl;
+                    std::cerr << ss.str();
+                };
+                printCtr(ctr2, "dec ctr2");
+                printCtr(ctr1, "dec ctr1");
             }
 
-            // read chaff length from first two bytes
-            if (gotu < 2) throw std::runtime_error("failed to read chaff length");
-            std::size_t chaffLen = static_cast<std::size_t>(tmp2[0]) | (static_cast<std::size_t>(tmp2[1]) << 8U);
-            if (chaffLen < kChaffMinBytes || chaffLen > kChaffMaxBytes) throw std::runtime_error("invalid chaff length");
+            // temporary output file (rename on success)
+            std::string tmpOut = outPath + ".tmp." + std::to_string(currentTimeSeconds());
+            std::ofstream out(tmpOut, std::ios::binary | std::ios::trunc);
+            if (!out)
+            {
+                std::ostringstream oss;
+                oss << "unable to open temporary output file: " << tmpOut;
+                throw std::runtime_error(oss.str());
+            }
 
+            // buffers
+            ByteVector inBuf;
+            inBuf.resize(kStreamChunkSize);
+            ByteVector midBuf;
+            midBuf.resize(kStreamChunkSize);
+            ByteVector augBuf;
+            augBuf.reserve(kStreamChunkSize);
+            std::vector<std::uint8_t> pending;
+
+            bool parsedChaff = false;
+            std::size_t chaffToSkip = 0;
             std::size_t plainSize = 0;
-            if (augmentedSize < 2 + chaffLen) throw std::runtime_error("corrupted augmented size");
-            plainSize = augmentedSize - 2 - chaffLen;
+            bool debugPrinted = false;
 
-            // initialize MAC with known plaintext size
-            Mac256 mac = macInit(passphrase, salt1, salt2, static_cast<std::uint32_t>(plainSize));
-
-            // handle initial decrypted bytes: skip 2 + chaffLen bytes from augmented
-            std::size_t skip = 2 + chaffLen;
-            std::size_t consumed = 0;
-            if (gotu > skip)
+            // process ciphertext stream; input file current pos is at start of ciphertext
+            while (in)
             {
-                std::size_t plainPart = gotu - skip;
-                macFeedBuffer(mac, tmp2.data() + skip, plainPart);
-                fout.write(reinterpret_cast<const char *>(tmp2.data() + skip), static_cast<std::streamsize>(plainPart));
-                consumed = gotu;
-            }
-            else if (gotu <= skip)
-            {
-                // still in chaff area; nothing to write
-                consumed = gotu;
-            }
+                in.read(reinterpret_cast<char *>(inBuf.data()), static_cast<std::streamsize>(inBuf.size()));
+                std::streamsize got = in.gcount();
+                if (got <= 0) break;
+                const std::size_t got_sz = static_cast<std::size_t>(got);
 
-            // continue streaming remaining ciphertext
-            while (fin)
-            {
-                fin.read(reinterpret_cast<char *>(inBuf.data()), static_cast<std::streamsize>(inBuf.size()));
-                std::streamsize g = fin.gcount();
-                if (g <= 0) break;
-                std::size_t gu = static_cast<std::size_t>(g);
+                // pass through combined double-pass decryption using streaming ctx
+                if (midBuf.size() < got_sz) midBuf.resize(got_sz);
+                if (augBuf.size() < got_sz) augBuf.resize(got_sz);
+                dpProcess(streamCtx, inBuf.data(), got_sz, augBuf.data());
 
-                applyEnhancedCipherChunk(inBuf.data(), gu, tmp1.data(), ks2, ctr2);
-                applyEnhancedCipherChunk(tmp1.data(), gu, tmp2.data(), ks1, ctr1);
-
-                // if we haven't finished skipping chaff, handle that
-                if (consumed < skip)
+                if (!debugPrinted)
                 {
-                    std::size_t to_skip = std::min(skip - consumed, gu);
-                    if (to_skip < gu)
+                    std::ostringstream s;
+                    s << "[info] first chunk cipher: ";
+                    for (std::size_t i = 0; i < std::min<std::size_t>(got_sz, 32); ++i)
+                        s << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(inBuf[i]);
+                    s << std::dec << std::endl;
+                    std::cerr << s.str();
+                    std::ostringstream s2;
+                    s2 << "[info] first chunk mid:    ";
+                    for (std::size_t i = 0; i < std::min<std::size_t>(got_sz, 32); ++i)
+                        s2 << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(midBuf[i]);
+                    s2 << std::dec << std::endl;
+                    std::cerr << s2.str();
+                    std::ostringstream s3;
+                    s3 << "[info] first chunk aug:    ";
+                    for (std::size_t i = 0; i < std::min<std::size_t>(got_sz, 32); ++i)
+                        s3 << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(augBuf[i]);
+                    s3 << std::dec << std::endl;
+                    std::cerr << s3.str();
+                    debugPrinted = true;
+                }
+
+                    // print counters after first decryption pass
+                    if (debugPrinted)
                     {
-                        // some plaintext in this chunk
-                        std::size_t plainPart = gu - to_skip;
-                        macFeedBuffer(mac, tmp2.data() + to_skip, plainPart);
-                        fout.write(reinterpret_cast<const char *>(tmp2.data() + to_skip), static_cast<std::streamsize>(plainPart));
+                        auto printCtr = [](const std::array<std::uint8_t, kBlockSize> &c, const char *name)
+                        {
+                            std::ostringstream ss;
+                            ss << "[info] " << name << " after first chunk: ";
+                            for (std::size_t i = 0; i < c.size(); ++i)
+                                ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(c[i]);
+                            ss << std::dec << std::endl;
+                            std::cerr << ss.str();
+                        };
+                        printCtr(streamCtx.ctr2, "dec ctr2");
+                        printCtr(streamCtx.ctr1, "dec ctr1");
                     }
-                    // else entirely chaff
-                    consumed += gu;
-                }
-                else
+
+                // append augmented bytes to pending buffer and process
+                pending.insert(pending.end(), augBuf.begin(), augBuf.begin() + got_sz);
+
+                // process as much as possible from pending: first parse header, skip chaff, then write plaintext
+                while (true)
                 {
-                    // all plaintext
-                    macFeedBuffer(mac, tmp2.data(), gu);
-                    fout.write(reinterpret_cast<const char *>(tmp2.data()), static_cast<std::streamsize>(gu));
+                    if (!parsedChaff)
+                    {
+                        // if we already have remaining chaff to skip from a previous round, consume it first
+                        if (chaffToSkip > 0)
+                        {
+                            std::size_t toDiscard = std::min(pending.size(), chaffToSkip);
+                            if (toDiscard > 0) pending.erase(pending.begin(), pending.begin() + toDiscard);
+                            chaffToSkip -= toDiscard;
+                            if (chaffToSkip > 0) break; // need more data to finish skipping
+                            parsedChaff = true; // finished skipping
+                        }
+
+                        if (!parsedChaff)
+                        {
+                            if (pending.size() < 2) break; // need header
+                            // read chaff length (2-byte LE)
+                            std::size_t chLen = static_cast<std::size_t>(pending[0]) | (static_cast<std::size_t>(pending[1]) << 8U);
+                            // remove header bytes
+                            pending.erase(pending.begin(), pending.begin() + 2);
+                            if (pending.size() >= chLen)
+                            {
+                                // we have all chaff bytes in pending; drop them and switch to plaintext mode
+                                pending.erase(pending.begin(), pending.begin() + chLen);
+                                parsedChaff = true;
+                                // any remaining pending bytes are plaintext; fall through to write
+                            }
+                            else
+                            {
+                                // not enough chaff bytes yet; set remaining and wait for more data
+                                chaffToSkip = chLen - pending.size();
+                                pending.clear();
+                                break;
+                            }
+                        }
+                    }
+
+                    if (parsedChaff)
+                    {
+                        if (pending.empty()) break;
+                        // print the first bytes of plaintext being written
+                        {
+                            std::ostringstream dbg;
+                            dbg << "[info] writing plaintext chunk (" << pending.size() << ") : ";
+                            for (std::size_t ii = 0; ii < std::min<std::size_t>(pending.size(), 32); ++ii)
+                                dbg << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(pending[ii]);
+                            dbg << std::dec << std::endl;
+                            std::cerr << dbg.str();
+                        }
+                        out.write(reinterpret_cast<const char *>(pending.data()), static_cast<std::streamsize>(pending.size()));
+                        if (!out) throw std::runtime_error("failed to write decrypted data");
+                        plainSize += pending.size();
+                        pending.clear();
+                        break;
+                    }
                 }
             }
 
-            // finalise and compare MAC
+            out.flush();
+            out.close();
+            in.close();
+
+            // compute MAC over plaintext (second pass) and verify
+            Mac256 mac = macInit(passphrase, salt1, salt2, static_cast<std::uint32_t>(plainSize));
+            std::ifstream tmpIn(tmpOut, std::ios::binary);
+            if (!tmpIn) { std::remove(tmpOut.c_str()); throw std::runtime_error("failed to open temporary decrypted file for MAC verification"); }
+            ByteVector readBuf;
+            readBuf.resize(kStreamChunkSize);
+            while (tmpIn)
+            {
+                tmpIn.read(reinterpret_cast<char *>(readBuf.data()), static_cast<std::streamsize>(readBuf.size()));
+                std::streamsize got = tmpIn.gcount();
+                if (got <= 0) break;
+                macFeedBuffer(mac, readBuf.data(), static_cast<std::size_t>(got));
+            }
+            tmpIn.close();
             macFinalize(mac);
+            // print stored and computed MACs
+            {
+                std::ostringstream s1, s2;
+                s1 << "[info] stored mac:  ";
+                s2 << "[info] computed mac:";
+                for (int ii = 0; ii < 4; ++ii)
+                {
+                    s1 << std::hex << std::setfill('0');
+                    s2 << std::hex << std::setfill('0');
+                    for (int shift = 56; shift >= 0; shift -= 8)
+                        s1 << std::setw(2) << static_cast<int>((storedMac.h[ii] >> shift) & 0xFFU);
+                    for (int shift = 56; shift >= 0; shift -= 8)
+                        s2 << std::setw(2) << static_cast<int>((mac.h[ii] >> shift) & 0xFFU);
+                }
+                std::cerr << s1.str() << std::dec << std::endl;
+                std::cerr << s2.str() << std::dec << std::endl;
+            }
+
             if (!constantTimeMacEq(mac, storedMac))
+            {
+                // preserve the bad output for debugging
+                std::string badPath = outPath + ".bad";
+                std::rename(tmpOut.c_str(), badPath.c_str());
+                std::cerr << "[info] preserved bad output: " << badPath << std::endl;
                 throw std::runtime_error("authentication failed wrong passphrase or corrupted data");
+            }
+
+            // rename temporary file to final output
+            if (std::rename(tmpOut.c_str(), outPath.c_str()) != 0)
+            {
+                // on failure attempt to copy then remove
+                ByteVector data = readBinaryFile(tmpOut);
+                writeBinaryFile(outPath, data);
+                std::remove(tmpOut.c_str());
+            }
+
+            // wipe key schedules
+            volatile std::uint8_t *p2 = reinterpret_cast<volatile std::uint8_t *>(&ks2);
+            for (std::size_t i = 0; i < sizeof(ks2); ++i) p2[i] = 0;
+            volatile std::uint8_t *p1 = reinterpret_cast<volatile std::uint8_t *>(&ks1);
+            for (std::size_t i = 0; i < sizeof(ks1); ++i) p1[i] = 0;
         }
     }
 
@@ -1804,11 +2343,16 @@ namespace therapist
 
         /* first encryption pass */
         auto ks1 = deriveHardenedSchedule(passphrase, salt1);
+        // ensure ks1 zeroed on scope exit
+        auto ks1_wipe = std::unique_ptr<HardenedKeySchedule, std::function<void(HardenedKeySchedule*)>>( 
+            &ks1, [](HardenedKeySchedule *p){ volatile std::uint8_t *vp = reinterpret_cast<volatile std::uint8_t *>(p); for (std::size_t i=0;i<sizeof(HardenedKeySchedule);++i) vp[i]=0; });
         ByteVector pass1;
         applyEnhancedCipher(augmented, pass1, ks1, salt1);
 
         /* second encryption pass with independent key */
         auto ks2 = deriveHardenedSchedule(passphrase, salt2);
+        auto ks2_wipe = std::unique_ptr<HardenedKeySchedule, std::function<void(HardenedKeySchedule*)>>( 
+            &ks2, [](HardenedKeySchedule *p){ volatile std::uint8_t *vp = reinterpret_cast<volatile std::uint8_t *>(p); for (std::size_t i=0;i<sizeof(HardenedKeySchedule);++i) vp[i]=0; });
         ByteVector pass2;
         applyEnhancedCipher(pass1, pass2, ks2, salt2);
 
@@ -1835,6 +2379,11 @@ namespace therapist
                     static_cast<std::uint8_t>((mac.h[i] >> shift) & 0xFFU));
 
         output.insert(output.end(), pass2.begin(), pass2.end());
+
+        // wipe intermediate buffers that may hold plaintext or transient data
+        secure_wipe(augmented);
+        secure_wipe(pass1);
+        secure_wipe(pass2);
         return output;
     }
 
@@ -2318,6 +2867,273 @@ namespace therapist
         return joinPath(exeDir, userProvided);
     }
 
+    // Basic built-in self-tests that validate in-memory and streaming paths.
+    bool runSelfTestsInternal(const std::string &exeDir)
+    {
+        try
+        {
+            std::string pass = "therapist-selftest";
+
+            std::cout << "self-test: empty payload round-trip" << std::endl;
+            // test 1: empty payload round-trip
+            ByteVector empty;
+            ByteVector e1 = encryptPayloadAuto(empty, pass);
+            ByteVector d1 = decryptPayloadAuto(e1, pass);
+            if (d1 != empty) throw std::runtime_error("empty payload round-trip failed");
+
+            std::cout << "self-test: small payload round-trip" << std::endl;
+            // test 2: small payload round-trip
+            ByteVector small = {'h', 'e', 'l', 'l', 'o'};
+            ByteVector e2 = encryptPayloadAuto(small, pass);
+            ByteVector d2 = decryptPayloadAuto(e2, pass);
+            if (d2 != small) throw std::runtime_error("small payload round-trip failed");
+
+            std::cout << "self-test: chunked pipeline round-trip (in-memory)" << std::endl;
+            {
+                // build small plaintext and augmented payload
+                ByteVector pl = {'T','e','s','t','C','h','u','n','k'};
+                ByteVector augmented = addChaffPadding(pl);
+                ByteVector s1 = generateSalt(kSaltSizeV5);
+                ByteVector s2 = generateSalt(kSaltSizeV5);
+                auto k1 = deriveHardenedSchedule(pass, s1);
+                auto k2 = deriveHardenedSchedule(pass, s2);
+                auto c1 = initCtrFromSalt(s1);
+                auto c2 = initCtrFromSalt(s2);
+
+                // simulate chunked two-pass encryption
+                ByteVector cipherStream;
+                cipherStream.reserve(augmented.size());
+                const std::size_t chunkSz = 3; // small chunk to exercise boundaries
+                std::size_t p = 0;
+                while (p < augmented.size())
+                {
+                    std::size_t chunk = std::min(chunkSz, augmented.size() - p);
+                    ByteVector outchunk(chunk);
+                    applyDoublePassCipherChunk(augmented.data() + p, chunk, outchunk.data(), k1, k2, c1, c2);
+                    cipherStream.insert(cipherStream.end(), outchunk.begin(), outchunk.end());
+                    p += chunk;
+                }
+
+                // now decrypt with chunked pipeline
+                auto d2c = initCtrFromSalt(s2);
+                auto d1c = initCtrFromSalt(s1);
+                ByteVector recovered;
+                recovered.reserve(cipherStream.size());
+                p = 0;
+                while (p < cipherStream.size())
+                {
+                    std::size_t chunk = std::min(chunkSz, cipherStream.size() - p);
+                    ByteVector outchunk(chunk);
+                    applyDoublePassCipherChunk(cipherStream.data() + p, chunk, outchunk.data(), k1, k2, d1c, d2c);
+                    recovered.insert(recovered.end(), outchunk.begin(), outchunk.end());
+                    p += chunk;
+                }
+
+                if (recovered != augmented)
+                    throw std::runtime_error("chunked in-memory pipeline round-trip failed");
+            }
+
+            std::cout << "self-test: simulated streaming pipeline (in-memory)" << std::endl;
+            {
+                // simulate exact streaming call sequence used by encryptFileStreamToFile
+                ByteVector pl = {'T','e','s','t','1','\n'};
+                // generate chaff header + chaff as streaming code does
+                std::uint8_t onec = 0; fillCryptoRandom(&onec, 1);
+                std::size_t chLen = kChaffMinBytes + (static_cast<std::size_t>(onec) % (kChaffMaxBytes - kChaffMinBytes + 1));
+                ByteVector chaff(chLen);
+                if (chLen > 0) fillCryptoRandom(chaff.data(), chLen);
+                std::uint8_t chHeader[2] = { static_cast<std::uint8_t>(chLen & 0xFFU), static_cast<std::uint8_t>((chLen >> 8U) & 0xFFU) };
+
+                ByteVector s1 = generateSalt(kSaltSizeV5);
+                ByteVector s2 = generateSalt(kSaltSizeV5);
+                auto k1 = deriveHardenedSchedule(pass, s1);
+                auto k2 = deriveHardenedSchedule(pass, s2);
+                auto c1 = initCtrFromSalt(s1);
+                auto c2 = initCtrFromSalt(s2);
+
+                // encryption streaming simulation: use the same stateful DP stream
+                ByteVector streamCipher;
+                DoublePassStreamCtx ectx;
+                dpInit(ectx, k1, k2, c1, c2);
+
+                // chHeader
+                {
+                    std::size_t chunk = 2;
+                    ByteVector out(chunk);
+                    dpProcess(ectx, chHeader, chunk, out.data());
+                    streamCipher.insert(streamCipher.end(), out.begin(), out.end());
+                }
+                // chaff
+                if (chLen > 0)
+                {
+                    std::size_t p2 = 0;
+                    while (p2 < chLen)
+                    {
+                        std::size_t chunk = std::min<std::size_t>(kStreamChunkSize, chLen - p2);
+                        ByteVector out(chunk);
+                        dpProcess(ectx, chaff.data() + p2, chunk, out.data());
+                        streamCipher.insert(streamCipher.end(), out.begin(), out.end());
+                        p2 += chunk;
+                    }
+                }
+                // plaintext
+                std::size_t p = 0;
+                const std::size_t chunkSz = 3;
+                while (p < pl.size())
+                {
+                    std::size_t chunk = std::min(chunkSz, pl.size() - p);
+                    ByteVector out(chunk);
+                    dpProcess(ectx, pl.data() + p, chunk, out.data());
+                    streamCipher.insert(streamCipher.end(), out.begin(), out.end());
+                    p += chunk;
+                }
+
+                // now simulate decrypt streaming reading same chunk sizes
+                auto dk2 = deriveHardenedSchedule(pass, s2);
+                auto dk1 = deriveHardenedSchedule(pass, s1);
+                auto dc2 = initCtrFromSalt(s2);
+                auto dc1 = initCtrFromSalt(s1);
+
+                ByteVector pending2;
+                std::size_t idx = 0;
+                bool parsed = false;
+                std::size_t skip = 0;
+                ByteVector recovered2;
+                DoublePassStreamCtx dctx;
+                dpInit(dctx, dk1, dk2, dc1, dc2);
+                while (idx < streamCipher.size())
+                {
+                    std::size_t chunk = std::min<std::size_t>(chunkSz, streamCipher.size() - idx);
+                    ByteVector aug(chunk);
+                    dpProcess(dctx, streamCipher.data() + idx, chunk, aug.data());
+                    // append augmented bytes
+                    pending2.insert(pending2.end(), aug.begin(), aug.end());
+
+                    // parse header and skip chaff
+                    while (true)
+                    {
+                        if (!parsed)
+                        {
+                            if (skip > 0)
+                            {
+                                std::size_t toDiscard = std::min(pending2.size(), skip);
+                                if (toDiscard > 0) pending2.erase(pending2.begin(), pending2.begin() + toDiscard);
+                                skip -= toDiscard;
+                                if (skip > 0) break;
+                                parsed = true;
+                            }
+                            if (!parsed)
+                            {
+                                if (pending2.size() < 2) break;
+                                std::size_t clen = static_cast<std::size_t>(pending2[0]) | (static_cast<std::size_t>(pending2[1]) << 8U);
+                                pending2.erase(pending2.begin(), pending2.begin() + 2);
+                                if (pending2.size() >= clen)
+                                {
+                                    pending2.erase(pending2.begin(), pending2.begin() + clen);
+                                    parsed = true;
+                                }
+                                else
+                                {
+                                    skip = clen - pending2.size();
+                                    pending2.clear();
+                                    break;
+                                }
+                            }
+                        }
+                        if (parsed)
+                        {
+                            if (pending2.empty()) break;
+                            recovered2.insert(recovered2.end(), pending2.begin(), pending2.end());
+                            pending2.clear();
+                            break;
+                        }
+                    }
+
+                    idx += chunk;
+                }
+
+                // compute expected combined keystream for the entire augmented stream
+                auto generateKeystream = [&](const HardenedKeySchedule &k1,
+                                             const HardenedKeySchedule &k2,
+                                             std::array<std::uint8_t, kBlockSize> ctr,
+                                             std::size_t totalLen)
+                {
+                    ByteVector ks(totalLen);
+                    std::size_t off = 0;
+                    while (off < totalLen)
+                    {
+                        std::array<std::uint8_t, kBlockSize> b1{}, b2{};
+                        std::uint64_t l1 = load64LE(ctr.data());
+                        std::uint64_t r1 = load64LE(ctr.data() + 8);
+                        encryptBlockV5(l1, r1, k1);
+                        store64LE(b1.data(), l1);
+                        store64LE(b1.data() + 8, r1);
+                        std::uint64_t l2 = load64LE(ctr.data());
+                        std::uint64_t r2 = load64LE(ctr.data() + 8);
+                        // note: advance ctr for k2 separately
+                        incrementCounter(ctr);
+                        l2 = load64LE(ctr.data()); // load new ctr for k2 (simplified placeholder)
+                        (void)l2; (void)r2;
+                        // produce combined by XORing b1 and b2 (approx - used only for debugging)
+                        for (std::size_t i = 0; i < kBlockSize && off + i < totalLen; ++i)
+                            ks[off + i] = static_cast<std::uint8_t>(b1[i] ^ b2[i]);
+                        off += kBlockSize;
+                    }
+                    return ks;
+                };
+
+                if (recovered2 != pl) {
+                    std::ostringstream ss; ss << "simulated streaming mismatch: got:";
+                    for (auto b: recovered2) ss << std::hex << (int)b << ",";
+                    ss << " expected:";
+                    for (auto b: pl) ss << std::hex << (int)b << ",";
+                    ss << std::dec << std::endl;
+                    std::cerr << ss.str();
+                    throw std::runtime_error("simulated streaming pipeline failed");
+                }
+            }
+
+            std::cout << "self-test: streaming file round-trip" << std::endl;
+            // test 3: streaming encrypt/decrypt to temporary files
+            char inName[L_tmpnam] = {};
+            char encName[L_tmpnam] = {};
+            char decName[L_tmpnam] = {};
+            if (!std::tmpnam(inName) || !std::tmpnam(encName) || !std::tmpnam(decName))
+                throw std::runtime_error("tmpnam failed");
+
+            const std::string inp(inName);
+            const std::string enc(encName);
+            const std::string dec(decName);
+
+            ByteVector payload = {'T', 'e', 's', 't', '1', '\n'};
+            writeBinaryFile(inp, payload);
+            encryptFileStreamToFile(inp, enc, pass);
+            decryptFileStreamToFile(enc, dec, pass);
+
+            ByteVector r1 = readBinaryFile(inp);
+            ByteVector r2 = readBinaryFile(dec);
+
+            // cleanup
+            std::remove(inp.c_str());
+            std::remove(enc.c_str());
+            std::remove(dec.c_str());
+
+            if (r1 != r2) throw std::runtime_error("streaming round-trip failed");
+
+            return true;
+        }
+        catch (const std::exception &ex)
+        {
+            std::cerr << "self-test exception: " << ex.what() << std::endl;
+            return false;
+        }
+        catch (...)
+        {
+            std::cerr << "self-test unknown exception" << std::endl;
+            return false;
+        }
+    }
+
 } // namespace therapist
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -2334,17 +3150,24 @@ int main(int argc, char *argv[])
     applyProgramNameToConsoleWindow();
 
 #ifdef _WIN32
-    switch (ensureAdministratorLaunch())
+    // Honor THERAPIST_DISABLE_SELF_PROTECTION to allow running without
+    // attempting an administrator relaunch (useful for CI, testing,
+    // and developer machines where elevation is not desired).
+    const char *disable_prot = std::getenv("THERAPIST_DISABLE_SELF_PROTECTION");
+    if (!(disable_prot && disable_prot[0] != '\0'))
     {
-    case AdminLaunchResult::Continue:
-        break;
-    case AdminLaunchResult::Relaunched:
-        return 0;
-    case AdminLaunchResult::Failed:
-        std::cerr << Color::error
-                  << "failed to obtain administrator privileges"
-                  << Color::reset << std::endl;
-        return 1;
+        switch (ensureAdministratorLaunch())
+        {
+        case AdminLaunchResult::Continue:
+            break;
+        case AdminLaunchResult::Relaunched:
+            return 0;
+        case AdminLaunchResult::Failed:
+            std::cerr << Color::error
+                      << "failed to obtain administrator privileges"
+                      << Color::reset << std::endl;
+            return 1;
+        }
     }
 #endif
 
@@ -2386,6 +3209,7 @@ int main(int argc, char *argv[])
 
     // --- parse CLI options (consume --kdf-iterations / --kdf-memory) ---
     std::vector<std::string> residualArgs;
+    bool requestSelfTest = false;
     for (int i = 1; i < argc; ++i)
     {
         std::string a(argv[i]);
@@ -2419,7 +3243,20 @@ int main(int argc, char *argv[])
             }
             continue;
         }
+        if (a == "--self-test" || a == "--run-self-test")
+        {
+            requestSelfTest = true;
+            continue;
+        }
         residualArgs.push_back(a);
+    }
+
+    if (requestSelfTest || std::getenv("THERAPIST_SELF_TEST"))
+    {
+        std::cout << "running self-tests..." << std::endl;
+        bool ok = runSelfTestsInternal(exeDir);
+        std::cout << (ok ? "self-tests passed" : "self-tests failed") << std::endl;
+        return ok ? 0 : 2;
     }
 
     while (true)
@@ -2669,9 +3506,37 @@ int main(int argc, char *argv[])
                 try
                 {
                     if (executeDecrypt)
-                        decryptFileStreamToFile(resolvedInputPath, outputPath, passphrase);
+                    {
+                        try
+                        {
+                            decryptFileStreamToFile(resolvedInputPath, outputPath, passphrase);
+                        }
+                        catch (const std::exception &ex)
+                        {
+                            std::cerr << Color::warning
+                                      << "streaming decrypt failed, falling back to in-memory: "
+                                      << ex.what() << Color::reset << std::endl;
+                            ByteVector data = readBinaryFile(resolvedInputPath);
+                            ByteVector outData = decryptPayloadAuto(data, passphrase);
+                            writeBinaryFile(outputPath, outData);
+                        }
+                    }
                     else
-                        encryptFileStreamToFile(resolvedInputPath, outputPath, passphrase);
+                    {
+                        try
+                        {
+                            encryptFileStreamToFile(resolvedInputPath, outputPath, passphrase);
+                        }
+                        catch (const std::exception &ex)
+                        {
+                            std::cerr << Color::warning
+                                      << "streaming encrypt failed, falling back to in-memory: "
+                                      << ex.what() << Color::reset << std::endl;
+                            ByteVector data = readBinaryFile(resolvedInputPath);
+                            ByteVector outData = encryptPayloadAuto(data, passphrase);
+                            writeBinaryFile(outputPath, outData);
+                        }
+                    }
 
                     std::cout << Color::success
                               << (executeDecrypt ? "decrypted" : "encrypted")
