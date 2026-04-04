@@ -1,4 +1,4 @@
-# TherapistEncrypter
+# TherapistEncrypter (still in dev)
 
 A single-file, self-contained C++17 command-line encryption tool. No external dependencies required - just compile and run or download the latest compiled program.
 
