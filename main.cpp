@@ -1,6 +1,3 @@
-// therapist encrypter - single-file C++17 command-line encryption tool
-// no external dependencies required
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -83,15 +80,38 @@ constexpr std::uint64_t kWhitenB =
     0x6A09E667F3BCC908ULL ^ 0xBB67AE8584CAA73BULL;
 
 // ---------------------------------------------------------------------------
-//  colors
+//  colors & symbols
 // ---------------------------------------------------------------------------
 namespace Color {
-    constexpr const char* reset   = "\033[0m";
-    constexpr const char* accent  = "\033[38;5;214m";
-    constexpr const char* muted   = "\033[38;5;244m";
-    constexpr const char* warn    = "\033[38;5;208m";
-    constexpr const char* error   = "\033[38;5;196m";
-    constexpr const char* ok      = "\033[38;5;82m";
+    constexpr const char* reset     = "\033[0m";
+    constexpr const char* bold      = "\033[1m";
+    constexpr const char* dim       = "\033[2m";
+    constexpr const char* underline = "\033[4m";
+    // theme
+    constexpr const char* title     = "\033[1;38;5;214m";
+    constexpr const char* accent    = "\033[38;5;214m";
+    constexpr const char* muted     = "\033[38;5;244m";
+    constexpr const char* label     = "\033[38;5;249m";
+    constexpr const char* input     = "\033[38;5;255m";
+    constexpr const char* border    = "\033[38;5;240m";
+    // status
+    constexpr const char* ok        = "\033[38;5;82m";
+    constexpr const char* okBold    = "\033[1;38;5;82m";
+    constexpr const char* warn      = "\033[38;5;208m";
+    constexpr const char* warnBold  = "\033[1;38;5;208m";
+    constexpr const char* error     = "\033[38;5;196m";
+    constexpr const char* errorBold = "\033[1;38;5;196m";
+    constexpr const char* info      = "\033[38;5;75m";
+    constexpr const char* infoBold  = "\033[1;38;5;75m";
+}
+
+namespace Sym {
+    constexpr const char* check = "\xe2\x9c\x93"; // checkmark
+    constexpr const char* cross = "\xe2\x9c\x97"; // x-mark
+    constexpr const char* warn  = "\xe2\x9a\xa0"; // warning
+    constexpr const char* dot   = "\xe2\x80\xa2"; // bullet
+    constexpr const char* arrow = "\xe2\x96\xba"; // arrow
+    constexpr const char* dash  = "\xe2\x94\x80"; // horiz line
 }
 
 // ---------------------------------------------------------------------------
@@ -1279,8 +1299,43 @@ void printBanner() {
 }
 
 void printDivider() {
-    std::cout << Color::muted << "  ----------------------------------------"
+    std::cout << "  " << Color::border;
+    for (int i = 0; i < 42; ++i) std::cout << Sym::dash;
+    std::cout << Color::reset << std::endl;
+}
+
+void printSection(const char* name) {
+    std::string t(name);
+    int pad = 38 - static_cast<int>(t.size());
+    std::cout << "\n  " << Color::accent << Sym::dash << Sym::dash
+              << " " << name << " " << Color::border;
+    for (int i = 0; i < pad; ++i) std::cout << Sym::dash;
+    std::cout << Color::reset << "\n" << std::endl;
+}
+
+void printOk(const std::string& msg) {
+    std::cout << "    " << Color::ok << Sym::check << Color::reset
+              << "  " << msg << std::endl;
+}
+
+void printFail(const std::string& msg) {
+    std::cout << "    " << Color::errorBold << Sym::cross << "  " << msg
               << Color::reset << std::endl;
+}
+
+void printWarn(const std::string& msg) {
+    std::cout << "    " << Color::warn << Sym::warn << "  " << msg
+              << Color::reset << std::endl;
+}
+
+void printNote(const std::string& msg) {
+    std::cout << "    " << Color::info << Sym::dot << Color::reset
+              << "  " << Color::label << msg << Color::reset << std::endl;
+}
+
+void printPrompt(const std::string& lbl) {
+    std::cout << "    " << Color::accent << Sym::arrow << Color::reset
+              << "  " << Color::label << lbl << Color::reset << " ";
 }
 
 // loading spinner
@@ -1394,11 +1449,10 @@ void typeOutAnimated(const std::string& text,
 //  self-test
 // ---------------------------------------------------------------------------
 bool runSelfTest(bool verbose) {
-    // save and override KDF params for speed
     std::size_t savedIter = gKdfIterations;
     std::size_t savedMem  = gKdfMemoryBytes;
     gKdfIterations  = 16;
-    gKdfMemoryBytes = 65536; // 64 KB
+    gKdfMemoryBytes = 65536;
 
     int passed = 0;
     int failed = 0;
@@ -1411,31 +1465,40 @@ bool runSelfTest(bool verbose) {
 
     auto runTest = [&](const char* name, const char* details, std::function<void()> fn) {
         ++total;
-        if (verbose)
-            std::cout << "  " << Color::muted << "[" << total << "] "
-                      << Color::reset << name << "..." << std::flush;
         try {
             fn();
             ++passed;
             if (verbose) {
-                std::cout << " " << Color::ok << "ok" << Color::reset << std::endl;
-                std::cout << "    " << Color::muted << details << Color::reset << std::endl;
+                std::cout << "    " << Color::ok << Sym::check << Color::reset
+                          << "  " << name << std::endl;
+                std::cout << "       " << Color::muted << details
+                          << Color::reset << std::endl;
             }
         } catch (const std::exception& ex) {
             ++failed;
             if (verbose) {
-                std::cout << " " << Color::error << "FAIL: " << ex.what()
+                std::cout << "    " << Color::errorBold << Sym::cross << Color::reset
+                          << "  " << name << "  " << Color::error << ex.what()
                           << Color::reset << std::endl;
-                std::cout << "    " << Color::muted << details << Color::reset << std::endl;
+                std::cout << "       " << Color::muted << details
+                          << Color::reset << std::endl;
             }
         }
     };
 
+    auto category = [&](const char* name) {
+        if (verbose) printSection(name);
+    };
+
     const std::string pass = "therapist-selftest";
 
-    // --- crypto primitives ---
+    // ── s-box & primitives ──
 
-    runTest("sbox invertibility", "checked inv(fwd(x)) == x and fwd(inv(x)) == x for all bytes 0..255", [&]() {
+    category("s-box & primitives");
+
+    runTest("sbox invertibility",
+            "checked inv(fwd(x)) == x and fwd(inv(x)) == x for all bytes 0..255",
+    [&]() {
         const auto& sb = sbox();
         for (int i = 0; i < 256; ++i) {
             std::uint8_t b = static_cast<std::uint8_t>(i);
@@ -1446,7 +1509,40 @@ bool runSelfTest(bool verbose) {
         }
     });
 
-    runTest("block cipher determinism", "encrypted same 128-bit block twice with same key; compared outputs are equal", [&]() {
+    runTest("sbox completeness",
+            "verified all 256 distinct values present in forward table",
+    [&]() {
+        const auto& sb = sbox();
+        std::array<bool, 256> seen{};
+        for (int i = 0; i < 256; ++i)
+            seen[static_cast<std::size_t>(sb.fwd[static_cast<std::size_t>(i)])] = true;
+        for (int i = 0; i < 256; ++i)
+            if (!seen[static_cast<std::size_t>(i)])
+                throw std::runtime_error("missing value " + std::to_string(i));
+    });
+
+    runTest("sbox fwd64 lookup table",
+            "verified fwd64[lane][b] == fwd[b] << (lane*8) for all lanes and bytes",
+    [&]() {
+        const auto& sb = sbox();
+        for (int lane = 0; lane < 8; ++lane) {
+            unsigned shift = static_cast<unsigned>(lane * 8);
+            for (int b = 0; b < 256; ++b) {
+                std::uint64_t expected =
+                    static_cast<std::uint64_t>(sb.fwd[static_cast<std::size_t>(b)]) << shift;
+                if (sb.fwd64[static_cast<std::size_t>(lane)][static_cast<std::size_t>(b)] != expected)
+                    throw std::runtime_error("mismatch at lane " + std::to_string(lane));
+            }
+        }
+    });
+
+    // ── block cipher ──
+
+    category("block cipher");
+
+    runTest("determinism",
+            "encrypted same 128-bit block twice with same key; outputs identical",
+    [&]() {
         ByteVector salt = generateSalt(kSaltSize);
         auto ks = deriveHardenedSchedule(pass, salt);
         ScopedKS w(ks);
@@ -1458,7 +1554,44 @@ bool runSelfTest(bool verbose) {
             throw std::runtime_error("same input gave different output");
     });
 
-    runTest("ctr encrypt/decrypt identity", "applied CTR encrypt then decrypt; compared decrypted == original (200 bytes)", [&]() {
+    runTest("non-identity",
+            "verified encrypted block differs from plaintext block",
+    [&]() {
+        ByteVector salt = generateSalt(kSaltSize);
+        auto ks = deriveHardenedSchedule(pass, salt);
+        ScopedKS w(ks);
+        std::uint64_t L = 0x0123456789ABCDEFULL, R = 0xFEDCBA9876543210ULL;
+        std::uint64_t origL = L, origR = R;
+        encryptBlockV5(L, R, ks);
+        if (L == origL && R == origR)
+            throw std::runtime_error("encrypted == plaintext");
+    });
+
+    runTest("avalanche (bit diffusion)",
+            "flipped 1 input bit; verified >25% of 128 output bits changed",
+    [&]() {
+        ByteVector salt = generateSalt(kSaltSize);
+        auto ks = deriveHardenedSchedule(pass, salt);
+        ScopedKS w(ks);
+        std::uint64_t L1 = 0xAAAAAAAAAAAAAAAAULL, R1 = 0x5555555555555555ULL;
+        std::uint64_t L2 = L1 ^ 1ULL, R2 = R1;
+        encryptBlockV5(L1, R1, ks);
+        encryptBlockV5(L2, R2, ks);
+        std::uint64_t dL = L1 ^ L2, dR = R1 ^ R2;
+        int bits = 0;
+        while (dL) { bits += static_cast<int>(dL & 1ULL); dL >>= 1; }
+        while (dR) { bits += static_cast<int>(dR & 1ULL); dR >>= 1; }
+        if (bits < 32)
+            throw std::runtime_error("only " + std::to_string(bits) + "/128 bits changed");
+    });
+
+    // ── ctr mode ──
+
+    category("ctr mode");
+
+    runTest("encrypt/decrypt identity",
+            "applied CTR encrypt then decrypt; compared decrypted == original (200 bytes)",
+    [&]() {
         ByteVector salt = generateSalt(kSaltSize);
         auto ks = deriveHardenedSchedule(pass, salt);
         ScopedKS w(ks);
@@ -1472,7 +1605,57 @@ bool runSelfTest(bool verbose) {
             throw std::runtime_error("decrypt(encrypt(x)) != x");
     });
 
-    runTest("mac consistency", "computed MAC twice for same input and salts; compared MACs equal", [&]() {
+    runTest("salt independence",
+            "encrypted same data with two different salts; verified ciphertexts differ",
+    [&]() {
+        ByteVector salt1 = generateSalt(kSaltSize);
+        ByteVector salt2 = generateSalt(kSaltSize);
+        auto ks = deriveHardenedSchedule(pass, salt1);
+        ScopedKS w(ks);
+        ByteVector data(64, 0x42);
+        ByteVector enc1, enc2;
+        applyCipher(data, enc1, ks, salt1);
+        applyCipher(data, enc2, ks, salt2);
+        if (enc1 == enc2)
+            throw std::runtime_error("different salts produced same ciphertext");
+    });
+
+    // ── key derivation ──
+
+    category("key derivation");
+
+    runTest("password sensitivity",
+            "derived keys from two different passwords; verified round keys differ",
+    [&]() {
+        ByteVector salt = generateSalt(kSaltSize);
+        auto ks1 = deriveHardenedSchedule("password-one", salt);
+        ScopedKS w1(ks1);
+        auto ks2 = deriveHardenedSchedule("password-two", salt);
+        ScopedKS w2(ks2);
+        if (ks1.rka[0] == ks2.rka[0] && ks1.rkb[0] == ks2.rkb[0])
+            throw std::runtime_error("different passwords produced same keys");
+    });
+
+    runTest("salt sensitivity",
+            "derived keys with same password but different salts; verified keys differ",
+    [&]() {
+        ByteVector s1 = generateSalt(kSaltSize);
+        ByteVector s2 = generateSalt(kSaltSize);
+        auto ks1 = deriveHardenedSchedule(pass, s1);
+        ScopedKS w1(ks1);
+        auto ks2 = deriveHardenedSchedule(pass, s2);
+        ScopedKS w2(ks2);
+        if (ks1.rka[0] == ks2.rka[0] && ks1.rkb[0] == ks2.rkb[0])
+            throw std::runtime_error("different salts produced same keys");
+    });
+
+    // ── mac ──
+
+    category("mac");
+
+    runTest("consistency",
+            "computed MAC twice for same input and salts; verified MACs equal",
+    [&]() {
         ByteVector data = {'t','e','s','t'};
         ByteVector s1 = generateSalt(kSaltSize);
         ByteVector s2 = generateSalt(kSaltSize);
@@ -1482,7 +1665,9 @@ bool runSelfTest(bool verbose) {
             throw std::runtime_error("same input produced different MAC");
     });
 
-    runTest("mac sensitivity", "computed MAC for different inputs with same salts; compared MACs differ", [&]() {
+    runTest("sensitivity",
+            "computed MAC for different inputs with same salts; verified MACs differ",
+    [&]() {
         ByteVector d1 = {'a'}, d2 = {'b'};
         ByteVector s1 = generateSalt(kSaltSize);
         ByteVector s2 = generateSalt(kSaltSize);
@@ -1492,9 +1677,13 @@ bool runSelfTest(bool verbose) {
             throw std::runtime_error("different input produced same MAC");
     });
 
-    // --- payload round-trips ---
+    // ── payload round-trips ──
 
-    runTest("empty payload round-trip (V6)", "encrypt(empty) -> decrypt; checked plaintext empty and version==6", [&]() {
+    category("payload round-trips");
+
+    runTest("empty payload (V6)",
+            "encrypt(empty) -> decrypt; verified plaintext empty and version==6",
+    [&]() {
         FileMetadata m{"", currentDateString()};
         ByteVector enc = encryptPayload({}, pass, m);
         DecryptResult dec = decryptPayload(enc, pass);
@@ -1504,7 +1693,20 @@ bool runSelfTest(bool verbose) {
             throw std::runtime_error("version mismatch");
     });
 
-    runTest("small payload + metadata verify", "after decrypt compared plaintext and metadata.originalName and metadata.date", [&]() {
+    runTest("1-byte payload",
+            "encrypted/decrypted a single byte; verified equality",
+    [&]() {
+        ByteVector plain = {0x42};
+        FileMetadata m{"one.bin", currentDateString()};
+        ByteVector enc = encryptPayload(plain, pass, m);
+        DecryptResult dec = decryptPayload(enc, pass);
+        if (dec.plaintext != plain)
+            throw std::runtime_error("single byte mismatch");
+    });
+
+    runTest("small payload + metadata",
+            "encrypted 5 bytes with filename/date; verified all fields after decrypt",
+    [&]() {
         ByteVector plain = {'h','e','l','l','o'};
         FileMetadata m{"test.txt", "01-01-2020"};
         ByteVector enc = encryptPayload(plain, pass, m);
@@ -1517,7 +1719,9 @@ bool runSelfTest(bool verbose) {
             throw std::runtime_error("date: " + dec.meta.date);
     });
 
-    runTest("single-block payload (16 bytes)", "encrypted/decrypted exactly one block (16 bytes); compared equality", [&]() {
+    runTest("single-block payload (16 bytes)",
+            "encrypted/decrypted exactly one block; verified equality",
+    [&]() {
         ByteVector plain(kBlockSize, 0xAA);
         FileMetadata m{"block.bin", currentDateString()};
         ByteVector enc = encryptPayload(plain, pass, m);
@@ -1526,7 +1730,9 @@ bool runSelfTest(bool verbose) {
             throw std::runtime_error("mismatch at block boundary");
     });
 
-    runTest("cross-block payload (17 bytes)", "encrypted/decrypted 17 bytes spanning blocks; compared equality", [&]() {
+    runTest("cross-block payload (17 bytes)",
+            "encrypted/decrypted 17 bytes spanning blocks; verified equality",
+    [&]() {
         ByteVector plain(kBlockSize + 1, 0xBB);
         FileMetadata m{"cross.bin", currentDateString()};
         ByteVector enc = encryptPayload(plain, pass, m);
@@ -1535,22 +1741,80 @@ bool runSelfTest(bool verbose) {
             throw std::runtime_error("mismatch at cross-block boundary");
     });
 
-    runTest("large payload (4096 bytes)", "encrypted/decrypted large buffer (4096 bytes); compared equality", [&]() {
+    runTest("large payload (4096 bytes)",
+            "encrypted/decrypted 4096 bytes; verified equality",
+    [&]() {
         ByteVector plain(4096);
         for (std::size_t i = 0; i < plain.size(); ++i)
             plain[i] = static_cast<std::uint8_t>(i & 0xFFU);
         FileMetadata m{"big.bin", currentDateString()};
         ByteVector enc = encryptPayload(plain, pass, m);
-        if (verbose)
-            std::cout << " [" << formatFileSize(enc.size()) << "]" << std::flush;
         DecryptResult dec = decryptPayload(enc, pass);
         if (dec.plaintext != plain)
             throw std::runtime_error("large payload mismatch");
     });
 
-    // --- authentication tests ---
+    runTest("metadata with special chars",
+            "used filename with unicode chars; verified preservation after decrypt",
+    [&]() {
+        ByteVector plain = {'d','a','t','a'};
+        FileMetadata m{"t\xc3\xa9st\xe2\x80\x94" "file.txt", currentDateString()};
+        ByteVector enc = encryptPayload(plain, pass, m);
+        DecryptResult dec = decryptPayload(enc, pass);
+        if (dec.plaintext != plain)
+            throw std::runtime_error("data mismatch");
+        if (dec.meta.originalName != m.originalName)
+            throw std::runtime_error("name mismatch: " + dec.meta.originalName);
+    });
 
-    runTest("wrong passphrase rejection", "attempted decrypt with wrong passphrase; expected failure (exception)", [&]() {
+    runTest("V6 header structure",
+            "verified magic='TPC6', version=6, saltLen=32, macLen=32 in output",
+    [&]() {
+        ByteVector plain = {'h','d','r'};
+        FileMetadata m{"h.bin", currentDateString()};
+        ByteVector enc = encryptPayload(plain, pass, m);
+        if (enc.size() < 7) throw std::runtime_error("output too short");
+        if (enc[0] != 'T' || enc[1] != 'P' || enc[2] != 'C' || enc[3] != '6')
+            throw std::runtime_error("bad magic bytes");
+        if (enc[4] != 6) throw std::runtime_error("bad version byte");
+        if (enc[5] != kSaltSize) throw std::runtime_error("bad saltLen");
+        if (enc[6] != kMacSize) throw std::runtime_error("bad macLen");
+    });
+
+    runTest("augmented V6 build/parse",
+            "built augmented payload; parsed and verified plaintext + metadata match",
+    [&]() {
+        ByteVector plain = {'t','e','s','t'};
+        FileMetadata m{"aug.txt", "15-03-2025"};
+        ByteVector aug = buildAugmentedV6(plain, m);
+        FileMetadata parsed;
+        ByteVector recovered = parseAugmentedV6(aug, parsed);
+        if (recovered != plain)
+            throw std::runtime_error("plaintext mismatch");
+        if (parsed.originalName != "aug.txt")
+            throw std::runtime_error("name mismatch");
+        if (parsed.date != "15-03-2025")
+            throw std::runtime_error("date mismatch");
+    });
+
+    runTest("double encrypt produces different output",
+            "encrypted same plaintext twice; verified outputs differ (random salts)",
+    [&]() {
+        ByteVector plain = {'d','u','p'};
+        FileMetadata m{"dup.bin", currentDateString()};
+        ByteVector enc1 = encryptPayload(plain, pass, m);
+        ByteVector enc2 = encryptPayload(plain, pass, m);
+        if (enc1 == enc2)
+            throw std::runtime_error("two encryptions are identical");
+    });
+
+    // ── authentication & tamper ──
+
+    category("authentication & tamper");
+
+    runTest("wrong passphrase rejection",
+            "attempted decrypt with wrong passphrase; verified failure",
+    [&]() {
         ByteVector plain = {'x'};
         FileMetadata m{"x.bin", currentDateString()};
         ByteVector enc = encryptPayload(plain, pass, m);
@@ -1561,11 +1825,12 @@ bool runSelfTest(bool verbose) {
             throw std::runtime_error("wrong passphrase accepted");
     });
 
-    runTest("tampered ciphertext detection", "tampered last ciphertext byte; expected decryption to fail", [&]() {
+    runTest("tampered ciphertext",
+            "flipped last ciphertext byte; verified decryption fails",
+    [&]() {
         ByteVector plain = {'s','e','c','r','e','t'};
         FileMetadata m{"t.bin", currentDateString()};
         ByteVector enc = encryptPayload(plain, pass, m);
-        // tamper with the last byte of ciphertext
         if (!enc.empty()) enc.back() ^= 0xFF;
         bool rejected = false;
         try { decryptPayload(enc, pass); }
@@ -1574,11 +1839,12 @@ bool runSelfTest(bool verbose) {
             throw std::runtime_error("tampered ciphertext accepted");
     });
 
-    runTest("tampered mac detection", "modified first MAC byte; expected MAC verification to fail", [&]() {
+    runTest("tampered mac",
+            "modified first MAC byte; verified MAC verification fails",
+    [&]() {
         ByteVector plain = {'m','a','c'};
         FileMetadata m{"m.bin", currentDateString()};
         ByteVector enc = encryptPayload(plain, pass, m);
-        // MAC starts at offset 4+3+32+32 = 71
         std::size_t macOff = 4 + 3 + kSaltSize * 2;
         if (enc.size() > macOff) enc[macOff] ^= 0x01;
         bool rejected = false;
@@ -1588,9 +1854,60 @@ bool runSelfTest(bool verbose) {
             throw std::runtime_error("tampered MAC accepted");
     });
 
-    // --- file I/O ---
+    runTest("truncated input rejection",
+            "fed 3-byte truncated input; verified exception thrown",
+    [&]() {
+        ByteVector tiny = {0x01, 0x02, 0x03};
+        bool rejected = false;
+        try { decryptPayload(tiny, pass); }
+        catch (...) { rejected = true; }
+        if (!rejected)
+            throw std::runtime_error("truncated input accepted");
+    });
 
-    runTest("file I/O round-trip", "wrote file, encrypted, decrypted, and compared resulting file contents match", [&]() {
+    runTest("wrong magic rejection",
+            "fed data with invalid magic bytes; verified exception thrown",
+    [&]() {
+        ByteVector bad = {'X','X','X','X', 6, 32, 32};
+        bad.resize(200, 0);
+        bool rejected = false;
+        try { decryptPayload(bad, pass); }
+        catch (...) { rejected = true; }
+        if (!rejected)
+            throw std::runtime_error("wrong magic accepted");
+    });
+
+    // ── counter ──
+
+    category("counter");
+
+    runTest("increment correctness",
+            "incremented counter from known value; verified low word +1 and carry",
+    [&]() {
+        std::array<std::uint8_t, kBlockSize> ctr{};
+        store64LE(ctr.data(), 0x00000000000000FFULL);
+        store64LE(ctr.data() + 8, 0ULL);
+        incrementCounter(ctr);
+        std::uint64_t lo = load64LE(ctr.data());
+        std::uint64_t hi = load64LE(ctr.data() + 8);
+        if (lo != 0x0000000000000100ULL || hi != 0ULL)
+            throw std::runtime_error("simple increment failed");
+        store64LE(ctr.data(), 0xFFFFFFFFFFFFFFFFULL);
+        store64LE(ctr.data() + 8, 0ULL);
+        incrementCounter(ctr);
+        lo = load64LE(ctr.data());
+        hi = load64LE(ctr.data() + 8);
+        if (lo != 0ULL || hi != 1ULL)
+            throw std::runtime_error("carry failed");
+    });
+
+    // ── file i/o ──
+
+    category("file i/o");
+
+    runTest("file round-trip",
+            "wrote -> encrypted -> decrypted -> read; verified file contents match",
+    [&]() {
         std::string tmpIn  = "selftest_input.tmp";
         std::string tmpEnc = "selftest_enc.tmp";
         std::string tmpDec = "selftest_dec.tmp";
@@ -1617,9 +1934,13 @@ bool runSelfTest(bool verbose) {
             throw std::runtime_error("file data mismatch");
     });
 
-    // --- message helpers ---
+    // ── message layer ──
 
-    runTest("message payload build/parse", "built message payload and parsed it; compared message and timestamp equality", [&]() {
+    category("message layer");
+
+    runTest("message payload build/parse",
+            "built message payload; parsed and verified message + timestamp equality",
+    [&]() {
         std::string msg = "hello from the self-test";
         std::uint64_t ts = currentTimeSeconds();
         ByteVector payload = buildMessagePayload(msg, ts);
@@ -1634,7 +1955,9 @@ bool runSelfTest(bool verbose) {
             throw std::runtime_error("timestamp mismatch");
     });
 
-    runTest("encrypted message round-trip", "encrypted message, decrypted and parsed; compared message equality after decrypt", [&]() {
+    runTest("encrypted message round-trip",
+            "encrypted message; decrypted and verified message equality",
+    [&]() {
         std::string msg = "encrypted test message";
         std::uint64_t ts = currentTimeSeconds();
         ByteVector payload = buildMessagePayload(msg, ts);
@@ -1650,7 +1973,7 @@ bool runSelfTest(bool verbose) {
             throw std::runtime_error("message mismatch after decrypt");
     });
 
-    // cleanup any leftover test files
+    // cleanup
     std::remove("selftest_input.tmp");
     std::remove("selftest_enc.tmp");
     std::remove("selftest_dec.tmp");
@@ -1660,27 +1983,25 @@ bool runSelfTest(bool verbose) {
     // summary
     if (verbose) {
         std::cout << std::endl;
-        std::cout << "  " << Color::muted << "cipher:     "
-                  << Color::reset << "feistel V5/V6, " << kRounds << " rounds, "
-                  << kBlockSize << "-byte block, double-pass CTR" << std::endl;
-        std::cout << "  " << Color::muted << "kdf:        "
-                  << Color::reset << savedIter << " iterations, "
-                  << formatFileSize(savedMem) << " memory" << std::endl;
-        std::cout << "  " << Color::muted << "mac:        "
-                  << Color::reset << "256-bit cascaded (4x FNV-like)" << std::endl;
-        std::cout << "  " << Color::muted << "salt:       "
-                  << Color::reset << kSaltSize << " bytes (x2)" << std::endl;
-        std::cout << "  " << Color::muted << "format:     "
-                  << Color::reset << "V6 with embedded filename + date" << std::endl;
+        printDivider();
         std::cout << std::endl;
-        std::cout << "  " << Color::muted << "results:    "
-                  << Color::ok << passed << " passed"
-                  << Color::reset << " / ";
-        if (failed > 0)
-            std::cout << Color::error << failed << " failed" << Color::reset;
+        printNote("cipher:   feistel V5/V6, " + std::to_string(kRounds) + " rounds, "
+                  + std::to_string(kBlockSize) + "-byte block, double-pass CTR");
+        printNote("kdf:      " + std::to_string(savedIter) + " iterations, "
+                  + formatFileSize(savedMem) + " memory");
+        printNote("mac:      256-bit cascaded (4x FNV-like)");
+        printNote("salt:     " + std::to_string(kSaltSize) + " bytes (x2)");
+        printNote("format:   V6 with embedded filename + date");
+        std::cout << std::endl;
+        if (failed == 0)
+            std::cout << "    " << Color::okBold << Sym::check << "  " << passed << " passed"
+                      << Color::reset << Color::muted << " / 0 failed / " << total << " total"
+                      << Color::reset << std::endl;
         else
-            std::cout << Color::muted << "0 failed" << Color::reset;
-        std::cout << " / " << total << " total" << std::endl;
+            std::cout << "    " << Color::errorBold << Sym::cross << "  "
+                      << Color::ok << passed << " passed" << Color::reset
+                      << " / " << Color::error << failed << " failed" << Color::reset
+                      << " / " << total << " total" << std::endl;
     }
 
     return failed == 0;
@@ -1747,8 +2068,8 @@ int main(int argc, char* argv[]) {
     if (!requestSelfTest) {
         bool ok = runSelfTest(false);
         if (!ok) {
-            std::cerr << Color::error
-                      << "  [!] startup self-test failed -- the program may not work correctly"
+            std::cerr << "    " << Color::errorBold << Sym::cross
+                      << "  startup self-test failed -- the program may not work correctly"
                       << Color::reset << std::endl;
         }
     }
@@ -1758,10 +2079,17 @@ int main(int argc, char* argv[]) {
         clearConsole(ansi);
         printBanner();
         printDivider();
-        std::cout << "  running self-tests...\n" << std::endl;
+        std::cout << std::endl;
+        printNote("running self-tests...");
+        std::cout << std::endl;
         bool ok = runSelfTest(true);
+        std::cout << std::endl;
         printDivider();
-        std::cout << (ok ? "  all tests passed" : "  some tests failed") << std::endl;
+        std::cout << std::endl;
+        std::cout << (ok
+            ? (std::string("    ") + Color::okBold + Sym::check + "  all tests passed" + Color::reset)
+            : (std::string("    ") + Color::errorBold + Sym::cross + "  some tests failed" + Color::reset))
+            << std::endl;
         return ok ? 0 : 2;
     }
 
@@ -1772,7 +2100,7 @@ int main(int argc, char* argv[]) {
         const std::string passphrase = args[1];
         const std::string outPath = buildEncryptedPath(inPath);
 
-        std::cout << "  encrypting " << extractFilename(inPath) << "..." << std::endl;
+        printNote("encrypting " + extractFilename(inPath) + "...");
         ByteVector data = readBinaryFile(inPath);
         FileMetadata meta{extractFilename(inPath), currentDateString()};
         ByteVector enc = withSpinner("deriving key", [&]() {
@@ -1780,7 +2108,7 @@ int main(int argc, char* argv[]) {
         });
         writeBinaryFile(outPath, enc);
         setEncryptedFileTimestamps(outPath);
-        std::cout << Color::ok << "  encrypted -> " << outPath << Color::reset << std::endl;
+        printOk("encrypted -> " + outPath);
         return 0;
     }
     if (args.size() == 3 && args[0] == "decrypt") {
@@ -1788,7 +2116,7 @@ int main(int argc, char* argv[]) {
         const std::string inPath = args[1];
         const std::string passphrase = args[2];
 
-        std::cout << "  decrypting " << extractFilename(inPath) << "..." << std::endl;
+        printNote("decrypting " + extractFilename(inPath) + "...");
         ByteVector data = readBinaryFile(inPath);
         DecryptResult result = withSpinner("deriving key", [&]() {
             return decryptPayload(data, passphrase);
@@ -1796,9 +2124,8 @@ int main(int argc, char* argv[]) {
         const std::string outPath = buildDecryptedPath(inPath, result.meta.originalName);
         writeBinaryFile(outPath, result.plaintext);
         if (!result.meta.originalName.empty())
-            std::cout << Color::muted << "  original: " << result.meta.originalName
-                      << "  (" << result.meta.date << ")" << Color::reset << std::endl;
-        std::cout << Color::ok << "  decrypted -> " << outPath << Color::reset << std::endl;
+            printNote("original: " + result.meta.originalName + "  (" + result.meta.date + ")");
+        printOk("decrypted -> " + outPath);
         return 0;
     }
 
@@ -1808,8 +2135,9 @@ int main(int argc, char* argv[]) {
     const std::string exeDir = executableDirectory(argc, argv);
 
     auto waitForMenu = [&]() {
+        std::cout << std::endl;
         printDivider();
-        std::cout << Color::muted << "  press enter to return to the menu" << Color::reset;
+        printPrompt("press enter to return");
         std::string dummy;
         std::getline(std::cin, dummy);
         clearConsole(ansi);
@@ -1820,14 +2148,17 @@ int main(int argc, char* argv[]) {
             clearConsole(ansi);
             printBanner();
             printDivider();
-            std::cout << Color::accent << "  [1] " << Color::reset << "encrypt a file" << std::endl;
-            std::cout << Color::accent << "  [2] " << Color::reset << "decrypt a file" << std::endl;
-            std::cout << Color::accent << "  [3] " << Color::reset << "write a secret message" << std::endl;
-            std::cout << Color::accent << "  [4] " << Color::reset << "read a secret message" << std::endl;
-            std::cout << Color::accent << "  [5] " << Color::reset << "run self-test" << std::endl;
-            std::cout << Color::accent << "  [0] " << Color::reset << "exit" << std::endl;
+            std::cout << std::endl;
+            std::cout << "    " << Color::accent << "[1]" << Color::reset << "  encrypt a file" << std::endl;
+            std::cout << "    " << Color::accent << "[2]" << Color::reset << "  decrypt a file" << std::endl;
+            std::cout << "    " << Color::accent << "[3]" << Color::reset << "  write an encrypted message" << std::endl;
+            std::cout << "    " << Color::accent << "[4]" << Color::reset << "  read an encrypted message" << std::endl;
+            std::cout << "    " << Color::accent << "[5]" << Color::reset << "  run self-test" << std::endl;
+            std::cout << "    " << Color::accent << "[0]" << Color::reset << "  exit" << std::endl;
+            std::cout << std::endl;
             printDivider();
-            std::cout << Color::muted << "  choose: " << Color::reset;
+            std::cout << std::endl;
+            printPrompt("choose:");
             std::string choice;
             if (!std::getline(std::cin, choice)) break;
             choice = trimCopy(choice);
@@ -1842,11 +2173,13 @@ int main(int argc, char* argv[]) {
                 clearConsole(ansi);
                 printBanner();
                 printDivider();
-                std::cout << Color::muted << "  file path: " << Color::reset;
+                printSection("encrypt a file");
+
+                printPrompt("file path:");
                 std::string filePath;
                 if (!std::getline(std::cin, filePath)) continue;
                 filePath = trimCopy(filePath);
-                if (filePath.empty()) { std::cout << "  no file specified" << std::endl; waitForMenu(); continue; }
+                if (filePath.empty()) { printFail("no file specified"); waitForMenu(); continue; }
 
                 // strip surrounding quotes if present
                 if (filePath.size() >= 2 &&
@@ -1855,26 +2188,26 @@ int main(int argc, char* argv[]) {
                     filePath = filePath.substr(1, filePath.size() - 2);
 
                 if (!fileExists(filePath)) {
-                    std::cout << Color::error << "  file not found: " << filePath << Color::reset << std::endl;
+                    printFail("file not found: " + filePath);
                     waitForMenu(); continue;
                 }
 
                 ByteVector data = readBinaryFile(filePath);
-                std::cout << Color::muted << "  file size: " << formatFileSize(data.size()) << Color::reset << std::endl;
+                printNote("file size: " + formatFileSize(data.size()));
 
-                std::cout << Color::muted << "  passphrase: " << Color::reset;
+                printPrompt("passphrase:");
                 std::string passphrase;
                 if (!std::getline(std::cin, passphrase)) continue;
                 if (passphrase.empty()) {
-                    std::cout << Color::error << "  passphrase cannot be empty" << Color::reset << std::endl;
+                    printFail("passphrase cannot be empty");
                     waitForMenu(); continue;
                 }
                 if (passphrase.size() < 8) {
-                    std::cout << Color::warn << "  warning: short passphrase (< 8 chars) is less secure" << Color::reset << std::endl;
+                    printWarn("short passphrase (< 8 chars) is less secure");
                 }
 
                 // optional custom output name
-                std::cout << Color::muted << "  output name (enter to skip): " << Color::reset;
+                printPrompt("output name (enter to skip):");
                 std::string customName;
                 std::getline(std::cin, customName);
                 customName = trimCopy(customName);
@@ -1892,9 +2225,8 @@ int main(int argc, char* argv[]) {
                 writeBinaryFile(outPath, enc);
                 setEncryptedFileTimestamps(outPath);
 
-                std::cout << Color::ok << "  encrypted -> " << outPath << Color::reset << std::endl;
-                std::cout << Color::muted << "  original name stored: " << meta.originalName
-                          << "  (" << meta.date << ")" << Color::reset << std::endl;
+                printOk("encrypted -> " + outPath);
+                printNote("original name stored: " + meta.originalName + "  (" + meta.date + ")");
                 waitForMenu();
                 continue;
             }
@@ -1904,11 +2236,13 @@ int main(int argc, char* argv[]) {
                 clearConsole(ansi);
                 printBanner();
                 printDivider();
-                std::cout << Color::muted << "  encrypted file path: " << Color::reset;
+                printSection("decrypt a file");
+
+                printPrompt("encrypted file path:");
                 std::string filePath;
                 if (!std::getline(std::cin, filePath)) continue;
                 filePath = trimCopy(filePath);
-                if (filePath.empty()) { std::cout << "  no file specified" << std::endl; waitForMenu(); continue; }
+                if (filePath.empty()) { printFail("no file specified"); waitForMenu(); continue; }
 
                 if (filePath.size() >= 2 &&
                     ((filePath.front() == '"' && filePath.back() == '"') ||
@@ -1916,23 +2250,23 @@ int main(int argc, char* argv[]) {
                     filePath = filePath.substr(1, filePath.size() - 2);
 
                 if (!fileExists(filePath)) {
-                    std::cout << Color::error << "  file not found: " << filePath << Color::reset << std::endl;
+                    printFail("file not found: " + filePath);
                     waitForMenu(); continue;
                 }
 
-                std::cout << Color::muted << "  passphrase: " << Color::reset;
+                printPrompt("passphrase:");
                 std::string passphrase;
                 if (!std::getline(std::cin, passphrase)) continue;
                 if (passphrase.empty()) {
-                    std::cout << Color::error << "  passphrase cannot be empty" << Color::reset << std::endl;
+                    printFail("passphrase cannot be empty");
                     waitForMenu(); continue;
                 }
                 if (passphrase.size() < 8) {
-                    std::cout << Color::warn << "  warning: short passphrase (< 8 chars) is less secure" << Color::reset << std::endl;
+                    printWarn("short passphrase (< 8 chars) is less secure");
                 }
 
                 ByteVector data = readBinaryFile(filePath);
-                std::cout << Color::muted << "  file size: " << formatFileSize(data.size()) << Color::reset << std::endl;
+                printNote("file size: " + formatFileSize(data.size()));
 
                 std::cout << std::endl;
                 DecryptResult result = withSpinner("deriving decryption key", [&]() {
@@ -1940,26 +2274,26 @@ int main(int argc, char* argv[]) {
                 });
 
                 if (!result.meta.originalName.empty()) {
-                    std::cout << Color::muted << "  original file: " << result.meta.originalName
-                              << "  (" << result.meta.date << ")" << Color::reset << std::endl;
+                    printNote("original file: " + result.meta.originalName
+                              + "  (" + result.meta.date + ")");
                 }
 
                 std::string outPath = buildDecryptedPath(filePath, result.meta.originalName);
 
                 // ask before overwriting
                 if (fileExists(outPath)) {
-                    std::cout << Color::warn << "  file already exists: " << outPath << Color::reset << std::endl;
-                    std::cout << Color::muted << "  overwrite? (y/n): " << Color::reset;
+                    printWarn("file already exists: " + outPath);
+                    printPrompt("overwrite? (y/n):");
                     std::string yn;
                     std::getline(std::cin, yn);
                     if (trimCopy(yn) != "y" && trimCopy(yn) != "Y") {
                         outPath = filePath + ".decrypted";
-                        std::cout << Color::muted << "  saving as: " << outPath << Color::reset << std::endl;
+                        printNote("saving as: " + outPath);
                     }
                 }
 
                 writeBinaryFile(outPath, result.plaintext);
-                std::cout << Color::ok << "  decrypted -> " << outPath << Color::reset << std::endl;
+                printOk("decrypted -> " + outPath);
                 waitForMenu();
                 continue;
             }
@@ -1969,24 +2303,25 @@ int main(int argc, char* argv[]) {
                 clearConsole(ansi);
                 printBanner();
                 printDivider();
-                std::cout << Color::muted << "  what would you like to tell me?: " << Color::reset;
+                printSection("write an encrypted message");
+
+                printPrompt("what would you like to tell me?:");
                 std::string message;
                 if (!std::getline(std::cin, message)) continue;
                 if (message.empty()) {
-                    std::cout << Color::error << "  you have to tell me something to hide your secret"
-                              << Color::reset << std::endl;
+                    printFail("you have to tell me something to hide your secret");
                     waitForMenu(); continue;
                 }
 
-                std::cout << Color::muted << "  passphrase: " << Color::reset;
+                printPrompt("passphrase:");
                 std::string passphrase;
                 if (!std::getline(std::cin, passphrase)) continue;
                 if (passphrase.empty()) {
-                    std::cout << Color::error << "  passphrase cannot be empty" << Color::reset << std::endl;
+                    printFail("passphrase cannot be empty");
                     waitForMenu(); continue;
                 }
                 if (passphrase.size() < 8) {
-                    std::cout << Color::warn << "  warning: short passphrase (< 8 chars) is less secure" << Color::reset << std::endl;
+                    printWarn("short passphrase (< 8 chars) is less secure");
                 }
 
                 std::uint64_t ts = currentTimeSeconds();
@@ -2001,8 +2336,7 @@ int main(int argc, char* argv[]) {
                 std::string outPath = generateMessageFilePath(exeDir);
                 writeBinaryFile(outPath, enc);
                 setEncryptedFileTimestamps(outPath);
-                std::cout << Color::ok << "  your secret has been saved to: " << outPath
-                          << Color::reset << std::endl;
+                printOk("your secret has been saved to: " + outPath);
                 waitForMenu();
                 continue;
             }
@@ -2012,18 +2346,20 @@ int main(int argc, char* argv[]) {
                 clearConsole(ansi);
                 printBanner();
                 printDivider();
+                printSection("read an encrypted message");
 
                 const auto available = listMessageFiles(exeDir);
                 std::string msgFile;
 
                 if (!available.empty()) {
-                    std::cout << Color::accent << "  available sessions:" << Color::reset << std::endl;
+                    std::cout << "    " << Color::accent << "available sessions:" << Color::reset << std::endl;
                     for (std::size_t i = 0; i < available.size(); ++i)
-                        std::cout << Color::accent << "    [" << (i + 1) << "] "
-                                  << Color::reset << available[i] << std::endl;
+                        std::cout << "      " << Color::accent << "[" << (i + 1) << "]"
+                                  << Color::reset << "  " << available[i] << std::endl;
+                    std::cout << std::endl;
                     printDivider();
-                    std::cout << Color::muted << "  choose (1-" << available.size()
-                              << ") or type a filename: " << Color::reset;
+                    std::cout << std::endl;
+                    printPrompt("choose (1-" + std::to_string(available.size()) + ") or filename:");
                     std::string sel;
                     if (!std::getline(std::cin, sel)) continue;
                     sel = trimCopy(sel);
@@ -2036,31 +2372,31 @@ int main(int argc, char* argv[]) {
                 }
 
                 if (msgFile.empty()) {
-                    std::cout << Color::muted << "  filename: " << Color::reset;
+                    printPrompt("filename:");
                     if (!std::getline(std::cin, msgFile)) continue;
                     msgFile = trimCopy(msgFile);
                 }
 
                 if (msgFile.empty()) {
-                    std::cout << Color::error << "  no file specified" << Color::reset << std::endl;
+                    printFail("no file specified");
                     waitForMenu(); continue;
                 }
 
                 std::string resolved = resolveRelativeToExe(exeDir, msgFile);
                 if (!fileExists(resolved)) {
-                    std::cout << Color::error << "  file not found: " << resolved << Color::reset << std::endl;
+                    printFail("file not found: " + resolved);
                     waitForMenu(); continue;
                 }
 
-                std::cout << Color::muted << "  passphrase: " << Color::reset;
+                printPrompt("passphrase:");
                 std::string passphrase;
                 if (!std::getline(std::cin, passphrase)) continue;
                 if (passphrase.empty()) {
-                    std::cout << Color::error << "  passphrase cannot be empty" << Color::reset << std::endl;
+                    printFail("passphrase cannot be empty");
                     waitForMenu(); continue;
                 }
                 if (passphrase.size() < 8) {
-                    std::cout << Color::warn << "  warning: short passphrase (< 8 chars) is less secure" << Color::reset << std::endl;
+                    printWarn("short passphrase (< 8 chars) is less secure");
                 }
 
                 ByteVector data = readBinaryFile(resolved);
@@ -2074,19 +2410,17 @@ int main(int argc, char* argv[]) {
                 std::uint64_t timestamp = 0;
                 if (parseMessagePayload(result.plaintext, messageText, timestamp)) {
                     std::cout << std::endl;
-                    std::cout << Color::ok << "  this is what you told me"
-                              << Color::reset << Color::muted
-                              << " (" << formatTimestamp(timestamp) << ")"
+                    std::cout << "    " << Color::okBold << Sym::check << Color::reset
+                              << "  this is what you told me"
+                              << Color::muted << " (" << formatTimestamp(timestamp) << ")"
                               << Color::reset << std::endl;
-                    std::cout << std::endl << "  ";
+                    std::cout << std::endl << "    ";
                     typeOutAnimated(messageText,
                                    std::chrono::milliseconds(70),
                                    std::chrono::milliseconds(220));
                     std::cout << std::endl;
                 } else {
-                    std::cout << Color::warn
-                              << "  unable to decode message format -- showing raw bytes"
-                              << Color::reset << std::endl;
+                    printWarn("unable to decode message format -- showing raw bytes");
                     if (!result.plaintext.empty())
                         std::cout.write(
                             reinterpret_cast<const char*>(result.plaintext.data()),
@@ -2102,23 +2436,26 @@ int main(int argc, char* argv[]) {
                 clearConsole(ansi);
                 printBanner();
                 printDivider();
-                std::cout << "  running self-tests...\n" << std::endl;
+                std::cout << std::endl;
+                printNote("running self-tests...");
+                std::cout << std::endl;
                 bool ok = runSelfTest(true);
+                std::cout << std::endl;
                 printDivider();
+                std::cout << std::endl;
                 std::cout << (ok
-                    ? (std::string(Color::ok) + "  all tests passed" + Color::reset)
-                    : (std::string(Color::error) + "  some tests failed" + Color::reset))
+                    ? (std::string("    ") + Color::okBold + Sym::check + "  all tests passed" + Color::reset)
+                    : (std::string("    ") + Color::errorBold + Sym::cross + "  some tests failed" + Color::reset))
                     << std::endl;
                 waitForMenu();
                 continue;
             }
 
-            std::cout << Color::warn << "  invalid option" << Color::reset << std::endl;
+            printWarn("invalid option");
             waitForMenu();
         }
         catch (const std::exception& ex) {
-            std::cerr << Color::error << "  error: " << ex.what()
-                      << Color::reset << std::endl;
+            printFail(std::string("error: ") + ex.what());
             waitForMenu();
         }
     }
