@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <unordered_set>
 
 #ifndef _WIN32
 #include <thread>
@@ -2132,19 +2133,134 @@ PasswordStrength evaluatePassword(const std::string& pass) {
         result.warnings.push_back("all characters are the same");
     }
 
-    std::string lower = pass;
-    for (auto& c : lower)
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    static const char* commonWords[] = {
-        "password", "123456", "qwerty", "abc123", "letmein",
-        "admin", "welcome", "monkey", "dragon", "master",
-        "login", "princess", "shadow", "sunshine", "trustno1"
+    // normalize (lowercase + common leet substitutions) (WORD LIST IS AI GENERATED)
+    auto normalizeLeet = [](const std::string& s) -> std::string {
+        std::string out;
+        out.reserve(s.size());
+        for (unsigned char ch : s) {
+            switch (ch) {
+                case '@': out.push_back('a'); break;
+                case '3': out.push_back('e'); break;
+                case '1': case '!': out.push_back('i'); break;
+                case '0': out.push_back('o'); break;
+                case '5': case '$': out.push_back('s'); break;
+                default: out.push_back(static_cast<char>(std::tolower(ch))); break;
+            }
+        }
+        return out;
     };
-    for (const auto& w : commonWords) {
-        if (lower.find(w) != std::string::npos) {
-            result.score = std::max(0, result.score - 20);
-            result.warnings.push_back(std::string("contains common word: ") + w);
-            break;
+
+    std::string norm = normalizeLeet(pass);
+
+    static const char* commonWords[] = {
+        "password", "123456", "12345678", "123456789", "1234567890",
+        "qwerty", "qwerty123", "qwertyuiop", "asdfgh", "asdfghjkl",
+        "letmein", "welcome", "admin", "root", "toor",
+        "password123", "1234567", "123123", "123321",
+        "123456a", "123456abc", "password1", "password12", "password!",
+        "login", "princess", "dragon", "master", "shadow",
+        "sunshine", "trustno1", "baseball", "football", "basketball",
+        "soccer", "hockey", "tennis", "golf", "racing",
+        "iloveyou", "lovely", "loveme", "loveyou", "babygirl",
+        "babyboy", "princess1", "princess123", "queen", "king",
+        "monkey", "monkey123", "chocolate", "cookie", "banana",
+        "apple", "cherry", "dragon1", "dragon123", "master1",
+        "master123", "shadow1", "shadow123", "sunshine1", "sunshine123",
+        // keyboard patterns
+        "qwerty", "qwertz", "azerty", "qazwsx", "wsxedc", "edcrfv",
+        "rfvtgb", "tgbzhn", "yhnujm", "ujmikol", "plmokn", "ijnbhu",
+        "zaq12wsx", "1qaz2wsx", "1q2w3e4r", "1q2w3e", "q1w2e3r4",
+        "asdzxc", "zxcvbn", "zxcvbnm", "poiuyt", "lkjhgf", "mnbvcx",
+        "qweasd", "wasd", "wasdqwer", "qwerasdf", "zxcvasdf",
+        "1234qwer", "qwer1234", "asdf1234", "1234asdf", "1q2w3e4r5t",
+        // context-specific
+        "therapist", "encrypt", "encrypted", "decrypt", "decrypted",
+        "cipher", "crypto", "cryptography", "security", "secure",
+        "unsafe", "pass123", "passw0rd", "p@ssword", "p@ssw0rd",
+        "secret", "secret123", "hidden", "private", "vault", "safe",
+        "lock", "unlock", "key", "aes", "rsa", "sha256", "hash", "salt",
+        // common dictionary words
+        "hello", "world", "test", "testing", "demo", "example",
+        "sample", "user", "username", "name", "first", "last",
+        "firstlast", "lastname", "firstname", "initial", "temp",
+        "temporary", "default", "standard", "normal", "common",
+        "general", "public", "private", "shared", "personal",
+        // sports teams & terms
+        "yankees", "redsox", "lakers", "warriors", "cowboys",
+        "steelers", "packers", "patriots", "chelsea", "arsenal",
+        "manutd", "realmadrid", "barcelona", "juventus", "bayern",
+        "manchester", "liverpool", "tottenham", "dodgers", "cubs",
+        // common names
+        "michael", "jennifer", "james", "john", "robert", "david",
+        "mary", "patricia", "linda", "barbara", "elizabeth", "susan",
+        "jessica", "sarah", "karen", "nancy", "lisa", "betty",
+        "daniel", "chris", "christopher", "matthew", "anthony", "mark",
+        "donald", "steven", "paul", "andrew", "joshua", "kevin",
+        "brian", "george", "edward", "ronald", "timothy", "jason",
+        "jeffrey", "ryan", "jacob", "gary", "nicholas", "eric",
+        "jonathan", "stephen", "larry", "justin", "scott", "brandon",
+        "benjamin", "samuel", "frank", "gregory", "raymond", "alexander",
+        "patrick", "jack", "dennis", "jerry", "tyler", "aaron",
+        // pet names
+        "buster", "buddy", "rocky", "lucky", "lady", "shadow",
+        "sammy", "bear", "tiger", "coco", "bailey", "max",
+        "maxwell", "charlie", "bella", "luna", "lucy", "daisy",
+        "molly", "maggy", "sadie", "chloe", "lily",
+        // dates & numbers
+        "2024", "2025", "2026", "2023", "2022", "2021", "2020",
+        "2000", "1999", "1998", "1997", "1996", "1995", "1990",
+        "1980", "1234", "4321", "6969", "1111", "0000", "7777",
+        "6666", "8888", "9999", "1010", "1212", "1221", "2112",
+        // profanity
+        "fuckyou", "fuckoff", "shithead", "asshole", "bitch",
+        "bastard", "damnit", "crap", "piss", "screwyou",
+        // l33t bases
+        "hacker", "hack", "crack", "cracker", "phreak", "phreaker",
+        "warez", "pirate", "torrent", "download", "upload",
+        "administrator", "system", "sysadmin", "webmaster", "host",
+        "server", "database", "network", "internet", "online",
+        "offline", "desktop", "laptop", "mobile", "phone",
+        "iphone", "android", "windows", "linux", "ubuntu",
+        "debian", "fedora", "chrome", "firefox", "safari",
+        "google", "facebook", "twitter", "instagram", "snapchat",
+        "reddit", "youtube", "amazon", "netflix", "spotify",
+        "paypal", "bank", "money", "cash", "dollar", "euro",
+        "bitcoin", "crypto", "wallet", "account", "member",
+        "subscribe", "free", "access", "entry", "allowed",
+        // keyboard walks extended
+        "qwe", "wer", "ert", "rty", "tyu", "yui", "uio", "iop",
+        "asd", "sdf", "dfg", "fgh", "ghj", "hjk", "jkl", "kl",
+        "zxc", "xcv", "cvb", "vbn", "bnm", "nm", "qaz", "wsx",
+        "edc", "rfv", "tgb", "yhn", "ujm", "ikl", "ol", "p",
+        // doubles/triples
+        "abc", "abcd", "abcde", "abcdef", "abcdefg", "hijklmnop",
+        "xyz", "xxx", "ooo", "aaa", "bbb", "ccc", "ddd", "eee",
+        "fff", "ggg", "hhh", "iii", "jjj", "kkk", "lll", "mmm",
+        "nnn", "ppp", "qqq", "rrr", "sss", "ttt", "uuu", "vvv",
+        "www", "yyy", "zzz"
+    };
+    const std::size_t commonWordsCount = sizeof(commonWords) / sizeof(commonWords[0]);
+    static std::unordered_set<std::string> commonWordSet;
+    static bool commonWordSetInited = false;
+    if (!commonWordSetInited) {
+        commonWordSet.reserve(commonWordsCount * 2);
+        for (std::size_t i = 0; i < commonWordsCount; ++i)
+            commonWordSet.insert(std::string(commonWords[i]));
+        commonWordSetInited = true;
+    }
+
+    // exact match of normalized password
+    if (commonWordSet.find(norm) != commonWordSet.end()) {
+        result.score = std::max(0, result.score - 20);
+        result.warnings.push_back(std::string("contains common word: ") + norm);
+    } else {
+        // substring check (catch embedded common words)
+        for (std::size_t i = 0; i < commonWordsCount; ++i) {
+            if (norm.find(commonWords[i]) != std::string::npos) {
+                result.score = std::max(0, result.score - 20);
+                result.warnings.push_back(std::string("contains common word: ") + commonWords[i]);
+                break;
+            }
         }
     }
 
@@ -2177,69 +2293,81 @@ PasswordStrength evaluatePassword(const std::string& pass) {
     return result;
 }
 
-bool checkPasswordAcceptable(const std::string& passphrase) {
-    if (passphrase.empty()) {
-        printFail("passphrase cannot be empty");
-        return false;
-    }
-    if (static_cast<int>(passphrase.size()) < gSettings.minPasswordLength) {
-        printFail("password must be at least " +
-                  std::to_string(gSettings.minPasswordLength) + " characters");
-        return false;
-    }
+bool checkPasswordAcceptable(std::string& passphrase) {
+    // allow the user to retry entering a passphrase if they decline weak-password confirmations
+    while (true) {
+        if (passphrase.empty()) {
+            printFail("passphrase cannot be empty");
+            return false;
+        }
+        if (static_cast<int>(passphrase.size()) < gSettings.minPasswordLength) {
+            printFail("password must be at least " +
+                      std::to_string(gSettings.minPasswordLength) + " characters");
+            return false;
+        }
 
-    bool hasUp = false, hasLo = false, hasDig = false, hasSp = false;
-    for (unsigned char ch : passphrase) {
-        if (std::isupper(ch))      hasUp = true;
-        else if (std::islower(ch)) hasLo = true;
-        else if (std::isdigit(ch)) hasDig = true;
-        else                       hasSp = true;
+        bool hasUp = false, hasLo = false, hasDig = false, hasSp = false;
+        for (unsigned char ch : passphrase) {
+            if (std::isupper(ch))      hasUp = true;
+            else if (std::islower(ch)) hasLo = true;
+            else if (std::isdigit(ch)) hasDig = true;
+            else                       hasSp = true;
+        }
+        if (gSettings.requireUppercase && !hasUp) {
+            printFail("password must contain uppercase letters");
+            return false;
+        }
+        if (gSettings.requireLowercase && !hasLo) {
+            printFail("password must contain lowercase letters");
+            return false;
+        }
+        if (gSettings.requireDigit && !hasDig) {
+            printFail("password must contain digits");
+            return false;
+        }
+        if (gSettings.requireSpecial && !hasSp) {
+            printFail("password must contain special characters");
+            return false;
+        }
+
+        auto strength = evaluatePassword(passphrase);
+
+        const char* color = Color::error;
+        if (strength.score >= 80)      color = Color::okBold;
+        else if (strength.score >= 60) color = Color::ok;
+        else if (strength.score >= 40) color = Color::warn;
+        else if (strength.score >= 20) color = Color::warnBold;
+
+        std::cout << "    " << color << "password strength: " << strength.rating
+                  << " (" << strength.score << "/100)" << Color::reset << std::endl;
+
+        if (gSettings.confirmWeakPasswords && strength.score < 40) {
+            for (const auto& w : strength.warnings)
+                printWarn(w);
+
+            printPrompt("weak password! are you sure? (y/n):");
+            std::string yn;
+            if (!std::getline(std::cin, yn)) return false;
+            yn = trimCopy(yn);
+            if (yn == "y" || yn == "Y") {
+                printPrompt("really proceed with this weak password? (y/n):");
+                if (!std::getline(std::cin, yn)) return false;
+                yn = trimCopy(yn);
+                if (yn == "y" || yn == "Y") return true;
+            }
+
+            // user declined — offer to enter a new password instead of returning to menu
+            printPrompt("enter a new passphrase (leave empty to cancel):");
+            std::string newp;
+            if (!std::getline(std::cin, newp)) return false;
+            newp = trimCopy(newp);
+            if (newp.empty()) return false; // cancel -> propagate false to caller
+            passphrase = newp; // loop and re-evaluate
+            continue;
+        }
+
+        return true;
     }
-    if (gSettings.requireUppercase && !hasUp) {
-        printFail("password must contain uppercase letters");
-        return false;
-    }
-    if (gSettings.requireLowercase && !hasLo) {
-        printFail("password must contain lowercase letters");
-        return false;
-    }
-    if (gSettings.requireDigit && !hasDig) {
-        printFail("password must contain digits");
-        return false;
-    }
-    if (gSettings.requireSpecial && !hasSp) {
-        printFail("password must contain special characters");
-        return false;
-    }
-
-    auto strength = evaluatePassword(passphrase);
-
-    const char* color = Color::error;
-    if (strength.score >= 80)      color = Color::okBold;
-    else if (strength.score >= 60) color = Color::ok;
-    else if (strength.score >= 40) color = Color::warn;
-    else if (strength.score >= 20) color = Color::warnBold;
-
-    std::cout << "    " << color << "password strength: " << strength.rating
-              << " (" << strength.score << "/100)" << Color::reset << std::endl;
-
-    if (gSettings.confirmWeakPasswords && strength.score < 40) {
-        for (const auto& w : strength.warnings)
-            printWarn(w);
-
-        printPrompt("weak password! are you sure? (y/n):");
-        std::string yn;
-        std::getline(std::cin, yn);
-        yn = trimCopy(yn);
-        if (yn != "y" && yn != "Y") return false;
-
-        printPrompt("really proceed with this weak password? (y/n):");
-        std::getline(std::cin, yn);
-        yn = trimCopy(yn);
-        if (yn != "y" && yn != "Y") return false;
-    }
-
-    return true;
 }
 
 void syncSettingsToGlobals() {
