@@ -73,6 +73,27 @@ constexpr std::size_t kKdfMemDefault   = 1048576; // 1 MiB
 static std::size_t gKdfIterations  = kKdfIterDefault;
 static std::size_t gKdfMemoryBytes = kKdfMemDefault;
 
+// ---------------------------------------------------------------------------
+//  user-configurable settings
+// ---------------------------------------------------------------------------
+struct EncryptionSettings {
+    std::size_t kdfIterations          = kKdfIterDefault;
+    std::size_t kdfMemoryBytes         = kKdfMemDefault;
+    std::size_t chaffMin               = kChaffMin;
+    std::size_t chaffMax               = kChaffMax;
+    bool        spoofTimestamps        = true;
+    bool        deleteSourceAfterEncrypt = false;
+    int         minPasswordLength      = 1;
+    bool        requireUppercase        = false;
+    bool        requireLowercase        = false;
+    bool        requireDigit            = false;
+    bool        requireSpecial          = false;
+    bool        confirmWeakPasswords    = true;
+    bool        showDetails             = true;
+};
+
+static EncryptionSettings gSettings;
+
 // block cipher whitening constants (derived from pi and e)
 constexpr std::uint64_t kWhitenA =
     0x3141592653589793ULL ^ 0x2718281828459045ULL;
@@ -106,12 +127,26 @@ namespace Color {
 }
 
 namespace Sym {
-    constexpr const char* check = "\xe2\x9c\x93"; // checkmark
-    constexpr const char* cross = "\xe2\x9c\x97"; // x-mark
-    constexpr const char* warn  = "\xe2\x9a\xa0"; // warning
-    constexpr const char* dot   = "\xe2\x80\xa2"; // bullet
-    constexpr const char* arrow = "\xe2\x96\xba"; // arrow
-    constexpr const char* dash  = "\xe2\x94\x80"; // horiz line
+    // ASCII fallbacks; upgraded to Unicode at runtime if terminal supports it
+    const char* check = "+";
+    const char* cross = "x";
+    const char* warn  = "!";
+    const char* dot   = "*";
+    const char* arrow = ">";
+    const char* dash  = "-";
+}
+
+static bool gUnicodeSupported = false;
+
+inline void initSymbols() {
+    if (gUnicodeSupported) {
+        Sym::check = "\xe2\x9c\x93";
+        Sym::cross = "\xe2\x9c\x97";
+        Sym::warn  = "\xe2\x9a\xa0";
+        Sym::dot   = "\xe2\x80\xa2";
+        Sym::arrow = "\xe2\x96\xba";
+        Sym::dash  = "\xe2\x94\x80";
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -685,8 +720,12 @@ inline std::string currentDateString() {
 ByteVector buildAugmentedV6(const ByteVector& plain, const FileMetadata& meta) {
     std::uint8_t rndByte[1];
     fillCryptoRandom(rndByte, 1);
-    std::size_t chaffLen = kChaffMin +
-        (static_cast<std::size_t>(rndByte[0]) % (kChaffMax - kChaffMin + 1));
+    std::size_t chMin = gSettings.chaffMin;
+    std::size_t chMax = gSettings.chaffMax;
+    if (chMin > chMax) std::swap(chMin, chMax);
+    if (chMax == 0) chMax = 1;
+    std::size_t chaffLen = chMin +
+        (static_cast<std::size_t>(rndByte[0]) % (chMax - chMin + 1));
 
     // truncate name if needed
     std::string name = meta.originalName;
@@ -720,8 +759,12 @@ ByteVector buildAugmentedV6(const ByteVector& plain, const FileMetadata& meta) {
 ByteVector buildAugmentedV5(const ByteVector& plain) {
     std::uint8_t rndByte[1];
     fillCryptoRandom(rndByte, 1);
-    std::size_t chaffLen = kChaffMin +
-        (static_cast<std::size_t>(rndByte[0]) % (kChaffMax - kChaffMin + 1));
+    std::size_t chMin = gSettings.chaffMin;
+    std::size_t chMax = gSettings.chaffMax;
+    if (chMin > chMax) std::swap(chMin, chMax);
+    if (chMax == 0) chMax = 1;
+    std::size_t chaffLen = chMin +
+        (static_cast<std::size_t>(rndByte[0]) % (chMax - chMin + 1));
 
     ByteVector aug;
     aug.reserve(2 + chaffLen + plain.size());
@@ -741,7 +784,7 @@ ByteVector parseAugmentedV6(const ByteVector& aug, FileMetadata& meta) {
     // read chaff
     std::size_t chaffLen = static_cast<std::size_t>(aug[0]) |
                            (static_cast<std::size_t>(aug[1]) << 8U);
-    if (chaffLen < kChaffMin || chaffLen > kChaffMax || 2 + chaffLen > aug.size())
+    if (chaffLen > 1024 || 2 + chaffLen > aug.size())
         throw std::runtime_error("authentication failed: wrong passphrase or corrupted data");
 
     std::size_t pos = 2 + chaffLen;
@@ -771,7 +814,7 @@ ByteVector parseAugmentedV5(const ByteVector& aug) {
 
     std::size_t chaffLen = static_cast<std::size_t>(aug[0]) |
                            (static_cast<std::size_t>(aug[1]) << 8U);
-    if (chaffLen < kChaffMin || chaffLen > kChaffMax || 2 + chaffLen > aug.size())
+    if (chaffLen > 1024 || 2 + chaffLen > aug.size())
         throw std::runtime_error("authentication failed: wrong passphrase or corrupted data");
 
     return ByteVector(aug.begin() + 2 + static_cast<std::ptrdiff_t>(chaffLen),
@@ -988,13 +1031,19 @@ std::string buildEncryptedPath(const std::string& inputPath) {
 std::string buildDecryptedPath(const std::string& inputPath,
                                const std::string& originalName)
 {
-    // prefer original name from metadata
+    // prefer original name from metadata (sanitize to prevent path traversal)
     if (!originalName.empty()) {
+        std::string safeName = originalName;
+        auto slashPos = safeName.find_last_of("\\/");
+        if (slashPos != std::string::npos)
+            safeName = safeName.substr(slashPos + 1);
+        if (safeName.empty() || safeName == "." || safeName == "..")
+            safeName = "decrypted_output";
         // resolve into same directory as input
         auto pos = inputPath.find_last_of("\\/");
         if (pos != std::string::npos)
-            return inputPath.substr(0, pos + 1) + originalName;
-        return originalName;
+            return inputPath.substr(0, pos + 1) + safeName;
+        return safeName;
     }
     // fallback: strip .encrypted
     if (inputPath.size() > 10 &&
@@ -1189,12 +1238,20 @@ bool enableAnsiColors() {
         if (GetConsoleMode(eh, &em))
             SetConsoleMode(eh, em | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
     }
-    SetConsoleOutputCP(CP_UTF8);
-    SetConsoleCP(CP_UTF8);
-    std::setlocale(LC_ALL, ".UTF-8");
+    gUnicodeSupported = (SetConsoleOutputCP(CP_UTF8) != 0);
+    if (gUnicodeSupported) {
+        SetConsoleCP(CP_UTF8);
+        std::setlocale(LC_ALL, ".UTF-8");
+    }
+    initSymbols();
     return true;
 #else
     std::setlocale(LC_ALL, "en_US.UTF-8");
+    const char* lang = std::getenv("LANG");
+    const char* lcAll = std::getenv("LC_ALL");
+    gUnicodeSupported = (lang && (std::strstr(lang, "UTF") || std::strstr(lang, "utf"))) ||
+                        (lcAll && (std::strstr(lcAll, "UTF") || std::strstr(lcAll, "utf")));
+    initSymbols();
     return true;
 #endif
 }
@@ -2034,6 +2091,162 @@ void loadKdfOverrides() {
     }
 }
 
+// ---------------------------------------------------------------------------
+//  password strength evaluation
+// ---------------------------------------------------------------------------
+struct PasswordStrength {
+    int score;
+    std::string rating;
+    std::vector<std::string> warnings;
+};
+
+PasswordStrength evaluatePassword(const std::string& pass) {
+    PasswordStrength result;
+    result.score = 0;
+    if (pass.size() >= 16)      result.score += 30;
+    else if (pass.size() >= 12) result.score += 25;
+    else if (pass.size() >= 8)  result.score += 15;
+    else if (pass.size() >= 6)  result.score += 8;
+    else                        result.score += 3;
+
+    bool hasUp = false, hasLo = false, hasDig = false, hasSp = false;
+    for (unsigned char ch : pass) {
+        if (std::isupper(ch))      hasUp = true;
+        else if (std::islower(ch)) hasLo = true;
+        else if (std::isdigit(ch)) hasDig = true;
+        else                       hasSp = true;
+    }
+    int variety = (hasUp?1:0) + (hasLo?1:0) + (hasDig?1:0) + (hasSp?1:0);
+    result.score += variety * 10;
+
+    std::string sorted = pass;
+    std::sort(sorted.begin(), sorted.end());
+    auto last = std::unique(sorted.begin(), sorted.end());
+    std::size_t unique = static_cast<std::size_t>(std::distance(sorted.begin(), last));
+    if (unique >= 10)     result.score += 20;
+    else if (unique >= 6) result.score += 10;
+    else                  result.score += 3;
+
+    if (unique == 1) {
+        result.score = std::max(0, result.score - 30);
+        result.warnings.push_back("all characters are the same");
+    }
+
+    std::string lower = pass;
+    for (auto& c : lower)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    static const char* commonWords[] = {
+        "password", "123456", "qwerty", "abc123", "letmein",
+        "admin", "welcome", "monkey", "dragon", "master",
+        "login", "princess", "shadow", "sunshine", "trustno1"
+    };
+    for (const auto& w : commonWords) {
+        if (lower.find(w) != std::string::npos) {
+            result.score = std::max(0, result.score - 20);
+            result.warnings.push_back(std::string("contains common word: ") + w);
+            break;
+        }
+    }
+
+    if (pass.size() > 3) {
+        bool sequential = true;
+        for (std::size_t i = 1; i < pass.size() && sequential; ++i) {
+            if (static_cast<unsigned char>(pass[i]) !=
+                static_cast<unsigned char>(pass[i - 1]) + 1)
+                sequential = false;
+        }
+        if (sequential) {
+            result.score = std::max(0, result.score - 15);
+            result.warnings.push_back("characters are sequential");
+        }
+    }
+
+    if (pass.size() < 8)  result.warnings.push_back("shorter than 8 characters");
+    if (!hasUp)            result.warnings.push_back("no uppercase letters");
+    if (!hasLo)            result.warnings.push_back("no lowercase letters");
+    if (!hasDig)           result.warnings.push_back("no digits");
+    if (!hasSp)            result.warnings.push_back("no special characters");
+
+    result.score = std::min(100, std::max(0, result.score));
+    if (result.score >= 80)      result.rating = "very strong";
+    else if (result.score >= 60) result.rating = "strong";
+    else if (result.score >= 40) result.rating = "fair";
+    else if (result.score >= 20) result.rating = "weak";
+    else                         result.rating = "very weak";
+
+    return result;
+}
+
+bool checkPasswordAcceptable(const std::string& passphrase) {
+    if (passphrase.empty()) {
+        printFail("passphrase cannot be empty");
+        return false;
+    }
+    if (static_cast<int>(passphrase.size()) < gSettings.minPasswordLength) {
+        printFail("password must be at least " +
+                  std::to_string(gSettings.minPasswordLength) + " characters");
+        return false;
+    }
+
+    bool hasUp = false, hasLo = false, hasDig = false, hasSp = false;
+    for (unsigned char ch : passphrase) {
+        if (std::isupper(ch))      hasUp = true;
+        else if (std::islower(ch)) hasLo = true;
+        else if (std::isdigit(ch)) hasDig = true;
+        else                       hasSp = true;
+    }
+    if (gSettings.requireUppercase && !hasUp) {
+        printFail("password must contain uppercase letters");
+        return false;
+    }
+    if (gSettings.requireLowercase && !hasLo) {
+        printFail("password must contain lowercase letters");
+        return false;
+    }
+    if (gSettings.requireDigit && !hasDig) {
+        printFail("password must contain digits");
+        return false;
+    }
+    if (gSettings.requireSpecial && !hasSp) {
+        printFail("password must contain special characters");
+        return false;
+    }
+
+    auto strength = evaluatePassword(passphrase);
+
+    const char* color = Color::error;
+    if (strength.score >= 80)      color = Color::okBold;
+    else if (strength.score >= 60) color = Color::ok;
+    else if (strength.score >= 40) color = Color::warn;
+    else if (strength.score >= 20) color = Color::warnBold;
+
+    std::cout << "    " << color << "password strength: " << strength.rating
+              << " (" << strength.score << "/100)" << Color::reset << std::endl;
+
+    if (gSettings.confirmWeakPasswords && strength.score < 40) {
+        for (const auto& w : strength.warnings)
+            printWarn(w);
+
+        printPrompt("weak password! are you sure? (y/n):");
+        std::string yn;
+        std::getline(std::cin, yn);
+        yn = trimCopy(yn);
+        if (yn != "y" && yn != "Y") return false;
+
+        printPrompt("really proceed with this weak password? (y/n):");
+        std::getline(std::cin, yn);
+        yn = trimCopy(yn);
+        if (yn != "y" && yn != "Y") return false;
+    }
+
+    return true;
+}
+
+void syncSettingsToGlobals() {
+    gKdfIterations  = gSettings.kdfIterations;
+    gKdfMemoryBytes = gSettings.kdfMemoryBytes;
+}
+
 } // namespace therapist
 
 // ===========================================================================
@@ -2045,6 +2258,8 @@ int main(int argc, char* argv[]) {
     const bool ansi = enableAnsiColors();
     applyConsoleTitle();
     loadKdfOverrides();
+    gSettings.kdfIterations = gKdfIterations;
+    gSettings.kdfMemoryBytes = gKdfMemoryBytes;
 
     // parse CLI arguments
     bool requestSelfTest = false;
@@ -2154,6 +2369,7 @@ int main(int argc, char* argv[]) {
             std::cout << "    " << Color::accent << "[3]" << Color::reset << "  write an encrypted message" << std::endl;
             std::cout << "    " << Color::accent << "[4]" << Color::reset << "  read an encrypted message" << std::endl;
             std::cout << "    " << Color::accent << "[5]" << Color::reset << "  run self-test" << std::endl;
+            std::cout << "    " << Color::accent << "[6]" << Color::reset << "  settings" << std::endl;
             std::cout << "    " << Color::accent << "[0]" << Color::reset << "  exit" << std::endl;
             std::cout << std::endl;
             printDivider();
@@ -2193,17 +2409,14 @@ int main(int argc, char* argv[]) {
                 }
 
                 ByteVector data = readBinaryFile(filePath);
-                printNote("file size: " + formatFileSize(data.size()));
+                if (gSettings.showDetails)
+                    printNote("file size: " + formatFileSize(data.size()));
 
                 printPrompt("passphrase:");
                 std::string passphrase;
                 if (!std::getline(std::cin, passphrase)) continue;
-                if (passphrase.empty()) {
-                    printFail("passphrase cannot be empty");
+                if (!checkPasswordAcceptable(passphrase)) {
                     waitForMenu(); continue;
-                }
-                if (passphrase.size() < 8) {
-                    printWarn("short passphrase (< 8 chars) is less secure");
                 }
 
                 // optional custom output name
@@ -2223,10 +2436,18 @@ int main(int argc, char* argv[]) {
                     return encryptPayload(data, passphrase, meta);
                 });
                 writeBinaryFile(outPath, enc);
-                setEncryptedFileTimestamps(outPath);
+                if (gSettings.spoofTimestamps)
+                    setEncryptedFileTimestamps(outPath);
 
                 printOk("encrypted -> " + outPath);
-                printNote("original name stored: " + meta.originalName + "  (" + meta.date + ")");
+                if (gSettings.showDetails)
+                    printNote("original name stored: " + meta.originalName + "  (" + meta.date + ")");
+                if (gSettings.deleteSourceAfterEncrypt) {
+                    if (std::remove(filePath.c_str()) == 0)
+                        printOk("source file deleted: " + filePath);
+                    else
+                        printWarn("could not delete source file");
+                }
                 waitForMenu();
                 continue;
             }
@@ -2261,12 +2482,10 @@ int main(int argc, char* argv[]) {
                     printFail("passphrase cannot be empty");
                     waitForMenu(); continue;
                 }
-                if (passphrase.size() < 8) {
-                    printWarn("short passphrase (< 8 chars) is less secure");
-                }
 
                 ByteVector data = readBinaryFile(filePath);
-                printNote("file size: " + formatFileSize(data.size()));
+                if (gSettings.showDetails)
+                    printNote("file size: " + formatFileSize(data.size()));
 
                 std::cout << std::endl;
                 DecryptResult result = withSpinner("deriving decryption key", [&]() {
@@ -2316,12 +2535,8 @@ int main(int argc, char* argv[]) {
                 printPrompt("passphrase:");
                 std::string passphrase;
                 if (!std::getline(std::cin, passphrase)) continue;
-                if (passphrase.empty()) {
-                    printFail("passphrase cannot be empty");
+                if (!checkPasswordAcceptable(passphrase)) {
                     waitForMenu(); continue;
-                }
-                if (passphrase.size() < 8) {
-                    printWarn("short passphrase (< 8 chars) is less secure");
                 }
 
                 std::uint64_t ts = currentTimeSeconds();
@@ -2335,7 +2550,8 @@ int main(int argc, char* argv[]) {
 
                 std::string outPath = generateMessageFilePath(exeDir);
                 writeBinaryFile(outPath, enc);
-                setEncryptedFileTimestamps(outPath);
+                if (gSettings.spoofTimestamps)
+                    setEncryptedFileTimestamps(outPath);
                 printOk("your secret has been saved to: " + outPath);
                 waitForMenu();
                 continue;
@@ -2395,9 +2611,6 @@ int main(int argc, char* argv[]) {
                     printFail("passphrase cannot be empty");
                     waitForMenu(); continue;
                 }
-                if (passphrase.size() < 8) {
-                    printWarn("short passphrase (< 8 chars) is less secure");
-                }
 
                 ByteVector data = readBinaryFile(resolved);
 
@@ -2448,6 +2661,176 @@ int main(int argc, char* argv[]) {
                     : (std::string("    ") + Color::errorBold + Sym::cross + "  some tests failed" + Color::reset))
                     << std::endl;
                 waitForMenu();
+                continue;
+            }
+
+            // ---- settings ----
+            if (c == '6') {
+                while (true) {
+                    clearConsole(ansi);
+                    printBanner();
+                    printDivider();
+                    printSection("settings");
+
+                    auto onOff = [](bool v) -> const char* { return v ? "ON" : "OFF"; };
+
+                    std::cout << "    " << Color::accent << " [1]" << Color::reset
+                              << "  KDF iterations       : " << Color::info << gSettings.kdfIterations << Color::reset << std::endl;
+                    std::cout << "    " << Color::accent << " [2]" << Color::reset
+                              << "  KDF memory           : " << Color::info << formatFileSize(gSettings.kdfMemoryBytes) << Color::reset << std::endl;
+                    std::cout << "    " << Color::accent << " [3]" << Color::reset
+                              << "  chaff padding min    : " << Color::info << gSettings.chaffMin << " bytes" << Color::reset << std::endl;
+                    std::cout << "    " << Color::accent << " [4]" << Color::reset
+                              << "  chaff padding max    : " << Color::info << gSettings.chaffMax << " bytes" << Color::reset << std::endl;
+                    std::cout << "    " << Color::accent << " [5]" << Color::reset
+                              << "  spoof timestamps     : " << Color::info << onOff(gSettings.spoofTimestamps) << Color::reset << std::endl;
+                    std::cout << "    " << Color::accent << " [6]" << Color::reset
+                              << "  delete source        : " << Color::info << onOff(gSettings.deleteSourceAfterEncrypt) << Color::reset << std::endl;
+                    std::cout << "    " << Color::accent << " [7]" << Color::reset
+                              << "  min password length  : " << Color::info << gSettings.minPasswordLength << Color::reset << std::endl;
+                    std::cout << "    " << Color::accent << " [8]" << Color::reset
+                              << "  require uppercase    : " << Color::info << onOff(gSettings.requireUppercase) << Color::reset << std::endl;
+                    std::cout << "    " << Color::accent << " [9]" << Color::reset
+                              << "  require lowercase    : " << Color::info << onOff(gSettings.requireLowercase) << Color::reset << std::endl;
+                    std::cout << "    " << Color::accent << "[10]" << Color::reset
+                              << "  require digits       : " << Color::info << onOff(gSettings.requireDigit) << Color::reset << std::endl;
+                    std::cout << "    " << Color::accent << "[11]" << Color::reset
+                              << "  require special chars: " << Color::info << onOff(gSettings.requireSpecial) << Color::reset << std::endl;
+                    std::cout << "    " << Color::accent << "[12]" << Color::reset
+                              << "  confirm weak password: " << Color::info << onOff(gSettings.confirmWeakPasswords) << Color::reset << std::endl;
+                    std::cout << "    " << Color::accent << "[13]" << Color::reset
+                              << "  show details         : " << Color::info << onOff(gSettings.showDetails) << Color::reset << std::endl;
+                    std::cout << "    " << Color::accent << "[14]" << Color::reset
+                              << "  reset to defaults" << std::endl;
+                    std::cout << "    " << Color::accent << " [0]" << Color::reset
+                              << "  back to main menu" << std::endl;
+                    std::cout << std::endl;
+                    printDivider();
+                    std::cout << std::endl;
+
+                    printPrompt("setting #:");
+                    std::string sel;
+                    if (!std::getline(std::cin, sel)) break;
+                    sel = trimCopy(sel);
+                    if (sel.empty()) continue;
+                    if (sel == "0") break;
+
+                    auto readValue = [&](const std::string& label) -> std::string {
+                        printPrompt(label);
+                        std::string v;
+                        std::getline(std::cin, v);
+                        return trimCopy(v);
+                    };
+
+                    auto toggleBool = [](bool& v) { v = !v; };
+
+                    if (sel == "1") {
+                        std::string v = readValue("iterations (e.g. 131072):");
+                        if (!v.empty()) {
+                            try {
+                                std::size_t n = std::stoull(v);
+                                if (n >= 1024) {
+                                    gSettings.kdfIterations = n;
+                                    syncSettingsToGlobals();
+                                    printOk("KDF iterations set to " + std::to_string(n));
+                                } else printFail("minimum 1024 iterations");
+                            } catch (...) { printFail("invalid number"); }
+                        }
+                    }
+                    else if (sel == "2") {
+                        std::string v = readValue("memory (e.g. 1M, 512K, 2M):");
+                        if (!v.empty()) {
+                            std::size_t n = 0;
+                            if (parseSizeWithSuffix(v, n) && n >= 65536) {
+                                gSettings.kdfMemoryBytes = n;
+                                syncSettingsToGlobals();
+                                printOk("KDF memory set to " + formatFileSize(n));
+                            } else printFail("minimum 64 KB");
+                        }
+                    }
+                    else if (sel == "3") {
+                        std::string v = readValue("min chaff bytes (1-512):");
+                        if (!v.empty()) {
+                            try {
+                                std::size_t n = std::stoull(v);
+                                if (n >= 1 && n <= 512) {
+                                    gSettings.chaffMin = n;
+                                    printOk("chaff min set to " + std::to_string(n));
+                                } else printFail("range: 1-512");
+                            } catch (...) { printFail("invalid number"); }
+                        }
+                    }
+                    else if (sel == "4") {
+                        std::string v = readValue("max chaff bytes (1-1024):");
+                        if (!v.empty()) {
+                            try {
+                                std::size_t n = std::stoull(v);
+                                if (n >= 1 && n <= 1024) {
+                                    gSettings.chaffMax = n;
+                                    printOk("chaff max set to " + std::to_string(n));
+                                } else printFail("range: 1-1024");
+                            } catch (...) { printFail("invalid number"); }
+                        }
+                    }
+                    else if (sel == "5") {
+                        toggleBool(gSettings.spoofTimestamps);
+                        printOk(std::string("timestamp spoofing ") + onOff(gSettings.spoofTimestamps));
+                    }
+                    else if (sel == "6") {
+                        toggleBool(gSettings.deleteSourceAfterEncrypt);
+                        printOk(std::string("delete source ") + onOff(gSettings.deleteSourceAfterEncrypt));
+                    }
+                    else if (sel == "7") {
+                        std::string v = readValue("min password length (0-128):");
+                        if (!v.empty()) {
+                            try {
+                                int n = std::stoi(v);
+                                if (n >= 0 && n <= 128) {
+                                    gSettings.minPasswordLength = n;
+                                    printOk("min password length set to " + std::to_string(n));
+                                } else printFail("range: 0-128");
+                            } catch (...) { printFail("invalid number"); }
+                        }
+                    }
+                    else if (sel == "8") {
+                        toggleBool(gSettings.requireUppercase);
+                        printOk(std::string("require uppercase ") + onOff(gSettings.requireUppercase));
+                    }
+                    else if (sel == "9") {
+                        toggleBool(gSettings.requireLowercase);
+                        printOk(std::string("require lowercase ") + onOff(gSettings.requireLowercase));
+                    }
+                    else if (sel == "10") {
+                        toggleBool(gSettings.requireDigit);
+                        printOk(std::string("require digits ") + onOff(gSettings.requireDigit));
+                    }
+                    else if (sel == "11") {
+                        toggleBool(gSettings.requireSpecial);
+                        printOk(std::string("require special chars ") + onOff(gSettings.requireSpecial));
+                    }
+                    else if (sel == "12") {
+                        toggleBool(gSettings.confirmWeakPasswords);
+                        printOk(std::string("confirm weak passwords ") + onOff(gSettings.confirmWeakPasswords));
+                    }
+                    else if (sel == "13") {
+                        toggleBool(gSettings.showDetails);
+                        printOk(std::string("show details ") + onOff(gSettings.showDetails));
+                    }
+                    else if (sel == "14") {
+                        gSettings = EncryptionSettings{};
+                        syncSettingsToGlobals();
+                        printOk("all settings reset to defaults");
+                    }
+                    else {
+                        printWarn("invalid option");
+                    }
+
+#ifdef _WIN32
+                    ::Sleep(600);
+#else
+                    std::this_thread::sleep_for(std::chrono::milliseconds(600));
+#endif
+                }
                 continue;
             }
 
