@@ -2515,12 +2515,11 @@ void showOutdatedVersionWarning(bool ansi) {
 #ifdef _WIN32
     std::string latest = formatAppVersion(gRemoteVersionInfo.latestVersion);
     std::string current = formatAppVersion(kCurrentAppVersion);
-    std::string popupText = std::string("This build is outdated.\n\n") +
+    std::string popupText = std::string("This program is outdated.\n\n") +
         "You're using " + current + "\n" +
         "Latest available: " + latest + "\n\n" +
-        "Please download the latest version from:\n" +
-        (gRemoteVersionInfo.downloadUrl.empty() ? std::string(kDefaultReleaseUrl) : gRemoteVersionInfo.downloadUrl) +
-        "\n\nThis message will also appear in the console.";
+        "Please download the latest version\n" +
+        "\nThis message will also appear in the console with the download link.";
     // try to disable console input / echo while the popup is visible so
     // keystrokes typed by the user while the dialog is open are not buffered
     HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
@@ -2550,13 +2549,13 @@ void showOutdatedVersionWarning(bool ansi) {
     printSection("update warning");
     // keep console output minimal: advise user to download latest and provide
     // the URL here (the popup intentionally omits the direct link)
-    printWarn("program is outdated, you're using " + current + " please download the latest version");
+    printWarn("this program is outdated, you're using " + current + " please download the latest version");
     if (!gRemoteVersionInfo.downloadUrl.empty())
         printNote("download: " + gRemoteVersionInfo.downloadUrl);
     std::cout << std::endl;
     printDivider();
     std::cout << std::endl;
-    printPrompt("press enter to continue:");
+    printPrompt("press enter to continue");
     std::string dummy;
     std::getline(std::cin, dummy);
 }
@@ -3496,4 +3495,3 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
-
