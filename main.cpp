@@ -2518,7 +2518,7 @@ void showOutdatedVersionWarning(bool ansi) {
     std::string popupText = std::string("This program is outdated.\n\n") +
         "You're using " + current + "\n" +
         "Latest available: " + latest + "\n\n" +
-        "Please download the latest version\n" +
+        "You can download the latest version\n" +
         "\nThis message will also appear in the console with the download link.";
     // try to disable console input / echo while the popup is visible so
     // keystrokes typed by the user while the dialog is open are not buffered
@@ -2549,9 +2549,9 @@ void showOutdatedVersionWarning(bool ansi) {
     printSection("update warning");
     // keep console output minimal: advise user to download latest and provide
     // the URL here (the popup intentionally omits the direct link)
-    printWarn("this program is outdated, you're using " + current + " please download the latest version");
+    printWarn("this program is outdated, you're using " + current + ", you can download the latest version");
     if (!gRemoteVersionInfo.downloadUrl.empty())
-        printNote("download: " + gRemoteVersionInfo.downloadUrl);
+        printNote("from here: " + gRemoteVersionInfo.downloadUrl);
     std::cout << std::endl;
     printDivider();
     std::cout << std::endl;
