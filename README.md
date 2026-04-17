@@ -125,4 +125,4 @@ V5 files (`TPC5` header) are still accepted for decryption but lack embedded met
 
 ## License
 
-MIT - see [LICENSE](LICENSE).
+Apache License 2.0 — see [LICENSE](LICENSE).
