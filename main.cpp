@@ -36,6 +36,26 @@
 #ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
 #define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
 #endif
+using HINTERNET = LPVOID;
+using INTERNET_PORT = WORD;
+
+constexpr INTERNET_PORT kInternetDefaultHttpsPort = 443;
+constexpr DWORD kWinHttpAccessTypeDefaultProxy = 0;
+constexpr DWORD kWinHttpFlagSecure = 0x00800000;
+constexpr DWORD kWinHttpQueryStatusCode = 19;
+constexpr DWORD kWinHttpQueryFlagNumber = 0x20000000;
+constexpr DWORD kHttpStatusOk = 200;
+
+using WinHttpOpenFn = HINTERNET (WINAPI*)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
+using WinHttpConnectFn = HINTERNET (WINAPI*)(HINTERNET, LPCWSTR, INTERNET_PORT, DWORD);
+using WinHttpOpenRequestFn = HINTERNET (WINAPI*)(HINTERNET, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR const*, DWORD);
+using WinHttpSetTimeoutsFn = BOOL (WINAPI*)(HINTERNET, int, int, int, int);
+using WinHttpSendRequestFn = BOOL (WINAPI*)(HINTERNET, LPCWSTR, DWORD, LPVOID, DWORD, DWORD, DWORD_PTR);
+using WinHttpReceiveResponseFn = BOOL (WINAPI*)(HINTERNET, LPVOID);
+using WinHttpQueryHeadersFn = BOOL (WINAPI*)(HINTERNET, DWORD, LPCWSTR, LPVOID, LPDWORD, LPDWORD);
+using WinHttpQueryDataAvailableFn = BOOL (WINAPI*)(HINTERNET, LPDWORD);
+using WinHttpReadDataFn = BOOL (WINAPI*)(HINTERNET, LPVOID, DWORD, LPDWORD);
+using WinHttpCloseHandleFn = BOOL (WINAPI*)(HINTERNET);
 #else
 #include <dirent.h>
 #include <sys/mman.h>
@@ -52,13 +72,43 @@ using ByteVector = std::vector<std::uint8_t>;
 // ---------------------------------------------------------------------------
 //  constants
 // ---------------------------------------------------------------------------
-// v5 (backward-compatible decrypt only)
-constexpr std::array<std::uint8_t, 4> kMagicV5 = {'T', 'P', 'C', '5'};
-constexpr std::uint8_t kVersionV5 = 5;
-
 // v6 (current default -- adds embedded filename + date)
 constexpr std::array<std::uint8_t, 4> kMagicV6 = {'T', 'P', 'C', '6'};
 constexpr std::uint8_t kVersionV6 = 6;
+
+struct AppVersion {
+    int major;
+    int minor;
+    int patch;
+    std::string preRelease; // optional pre-release label (e.g. "pre3", "rc1")
+};
+
+struct RemoteVersionInfo {
+    bool checked = false;
+    bool succeeded = false;
+    bool outdated = false;
+    AppVersion latestVersion{0, 0, 0};
+    std::string downloadUrl;
+    std::string versionInfoUrl;
+    std::string errorMessage;
+    // (SHA256 verification removed)
+};
+
+// Application identity / version (single edit point)
+constexpr const char* kAppExeName = "therapist";
+constexpr const char* kAppVersionText = "0.2.0pre3"; // update this one place for compiled default
+// Default current version text. You can override at runtime with
+// the THERAPIST_CURRENT_VERSION environment variable
+constexpr const char* kCurrentVersionText = kAppVersionText;
+static AppVersion kCurrentAppVersion{0, 0, 0, ""};
+constexpr const char* kDefaultVersionInfoUrl =
+    "https://raw.githubusercontent.com/ytaxx/TherapistEncrypter/refs/heads/v0.2.x/version.txt";
+constexpr const char* kDefaultReleaseUrl =
+    "https://github.com/ytaxx/TherapistEncrypter/releases";
+constexpr int kVersionResolveTimeoutMs = 2000;
+constexpr int kVersionConnectTimeoutMs = 3000;
+constexpr int kVersionSendTimeoutMs = 2000;
+constexpr int kVersionReceiveTimeoutMs = 3000;
 
 constexpr std::size_t kSaltSize     = 32;
 constexpr std::size_t kMacSize      = 32;   // 4 x u64
@@ -94,6 +144,54 @@ struct EncryptionSettings {
 };
 
 static EncryptionSettings gSettings;
+static RemoteVersionInfo gRemoteVersionInfo;
+
+inline int compareAppVersion(const AppVersion& left, const AppVersion& right) {
+    if (left.major != right.major) return left.major < right.major ? -1 : 1;
+    if (left.minor != right.minor) return left.minor < right.minor ? -1 : 1;
+    if (left.patch != right.patch) return left.patch < right.patch ? -1 : 1;
+    // handle pre-release: a release (empty preRelease) is considered greater
+    if (left.preRelease.empty() && right.preRelease.empty()) return 0;
+    if (left.preRelease.empty()) return 1;  // left is release, right is pre-release
+    if (right.preRelease.empty()) return -1; // left pre-release < release
+
+    // both have pre-release labels: try to compare intelligently
+    if (left.preRelease == right.preRelease) return 0;
+
+    // split alpha prefix and numeric suffix (e.g. "pre3" -> "pre", 3)
+    auto splitAlphaNum = [](const std::string& s) {
+        std::size_t i = s.size();
+        while (i > 0 && std::isdigit(static_cast<unsigned char>(s[i-1]))) --i;
+        std::string prefix = s.substr(0, i);
+        long long num = -1;
+        if (i < s.size()) {
+            try { num = std::stoll(s.substr(i)); } catch (...) { num = -1; }
+        }
+        return std::make_pair(prefix, num);
+    };
+
+    auto L = splitAlphaNum(left.preRelease);
+    auto R = splitAlphaNum(right.preRelease);
+    if (L.first != R.first) return L.first < R.first ? -1 : 1;
+    if (L.second != R.second) {
+        if (L.second == -1) return -1;
+        if (R.second == -1) return 1;
+        return L.second < R.second ? -1 : 1;
+    }
+    return left.preRelease < right.preRelease ? -1 : 1;
+}
+
+inline bool isProgramOutdated() {
+    return gRemoteVersionInfo.succeeded && gRemoteVersionInfo.outdated;
+}
+
+inline std::string formatAppVersion(const AppVersion& version) {
+    std::string s = std::to_string(version.major) + "." +
+           std::to_string(version.minor) + "." +
+           std::to_string(version.patch);
+    if (!version.preRelease.empty()) s += version.preRelease;
+    return s;
+}
 
 // block cipher whitening constants (derived from pi and e)
 constexpr std::uint64_t kWhitenA =
@@ -521,7 +619,7 @@ HardenedKeySchedule deriveHardenedSchedule(const std::string& pass,
 }
 
 // ---------------------------------------------------------------------------
-//  v5 block cipher
+//  block cipher
 // ---------------------------------------------------------------------------
 inline std::uint64_t enhancedRoundFunction(std::uint64_t half,
                                            std::uint64_t keyA,
@@ -543,7 +641,7 @@ inline std::uint64_t enhancedRoundFunction(std::uint64_t half,
     return half;
 }
 
-inline void encryptBlockV5(std::uint64_t& L, std::uint64_t& R,
+inline void encryptBlock(std::uint64_t& L, std::uint64_t& R,
                            const HardenedKeySchedule& ks)
 {
     L ^= ks.rka[0] ^ kWhitenA;
@@ -587,7 +685,7 @@ void applyCipher(const ByteVector& in, ByteVector& out,
     while (off < in.size()) {
         std::uint64_t l = load64LE(ctr.data());
         std::uint64_t r = load64LE(ctr.data() + 8);
-        encryptBlockV5(l, r, ks);
+        encryptBlock(l, r, ks);
         store64LE(ksBuf.data(), l);
         store64LE(ksBuf.data() + 8, r);
         std::size_t chunk = std::min<std::size_t>(kBlockSize, in.size() - off);
@@ -756,27 +854,6 @@ ByteVector buildAugmentedV6(const ByteVector& plain, const FileMetadata& meta) {
     return aug;
 }
 
-// build augmented payload: chaff + plaintext (V5 legacy, no metadata)
-ByteVector buildAugmentedV5(const ByteVector& plain) {
-    std::uint8_t rndByte[1];
-    fillCryptoRandom(rndByte, 1);
-    std::size_t chMin = gSettings.chaffMin;
-    std::size_t chMax = gSettings.chaffMax;
-    if (chMin > chMax) std::swap(chMin, chMax);
-    if (chMax == 0) chMax = 1;
-    std::size_t chaffLen = chMin +
-        (static_cast<std::size_t>(rndByte[0]) % (chMax - chMin + 1));
-
-    ByteVector aug;
-    aug.reserve(2 + chaffLen + plain.size());
-    aug.push_back(static_cast<std::uint8_t>(chaffLen & 0xFFU));
-    aug.push_back(static_cast<std::uint8_t>((chaffLen >> 8U) & 0xFFU));
-    aug.resize(2 + chaffLen);
-    fillCryptoRandom(aug.data() + 2, chaffLen);
-    aug.insert(aug.end(), plain.begin(), plain.end());
-    return aug;
-}
-
 // parse V6 augmented payload: extract metadata + plaintext
 ByteVector parseAugmentedV6(const ByteVector& aug, FileMetadata& meta) {
     if (aug.size() < 2)
@@ -808,26 +885,14 @@ ByteVector parseAugmentedV6(const ByteVector& aug, FileMetadata& meta) {
     return ByteVector(aug.begin() + pos, aug.end());
 }
 
-// parse V5 augmented payload: just strip chaff
-ByteVector parseAugmentedV5(const ByteVector& aug) {
-    if (aug.size() < 2)
-        throw std::runtime_error("authentication failed: wrong passphrase or corrupted data");
 
-    std::size_t chaffLen = static_cast<std::size_t>(aug[0]) |
-                           (static_cast<std::size_t>(aug[1]) << 8U);
-    if (chaffLen > 1024 || 2 + chaffLen > aug.size())
-        throw std::runtime_error("authentication failed: wrong passphrase or corrupted data");
-
-    return ByteVector(aug.begin() + 2 + static_cast<std::ptrdiff_t>(chaffLen),
-                      aug.end());
-}
 
 // ---------------------------------------------------------------------------
 //  encrypt / decrypt payloads
 // ---------------------------------------------------------------------------
 struct DecryptResult {
     ByteVector plaintext;
-    FileMetadata meta; // populated for V6; empty for V5
+    FileMetadata meta; // populated for V6
     std::uint8_t version = 0;
 };
 
@@ -876,7 +941,7 @@ ByteVector encryptPayload(const ByteVector& plain,
     return output;
 }
 
-// auto-detect V5 or V6; returns plaintext + metadata
+// auto-detect payload format; returns plaintext + metadata (V6 only)
 DecryptResult decryptPayload(const ByteVector& input,
                              const std::string& passphrase)
 {
@@ -884,15 +949,29 @@ DecryptResult decryptPayload(const ByteVector& input,
     if (input.size() < baseHdr)
         throw std::invalid_argument("encrypted data is too short");
 
-    // detect version
-    bool isV5 = std::equal(kMagicV5.begin(), kMagicV5.end(), input.begin());
+    // detect version (only V6 supported)
     bool isV6 = std::equal(kMagicV6.begin(), kMagicV6.end(), input.begin());
-    if (!isV5 && !isV6)
+    if (!isV6) {
+        if (input.size() >= 4 &&
+            input[0] == 'T' && input[1] == 'P' && input[2] == 'C' &&
+            std::isdigit(static_cast<unsigned char>(input[3])) != 0 &&
+            static_cast<std::uint8_t>(input[3] - '0') > kVersionV6) {
+            throw std::runtime_error(
+                "encrypted data uses a newer format; this program is outdated, "
+                "please download the latest for flawless usage");
+        }
         throw std::runtime_error("encrypted data header mismatch");
+    }
 
     std::uint8_t version = input[4];
-    if ((isV5 && version != kVersionV5) || (isV6 && version != kVersionV6))
+    if (version != kVersionV6) {
+        if (version > kVersionV6) {
+            throw std::runtime_error(
+                "encrypted data uses a newer format; this program is outdated, "
+                "please download the latest for flawless usage");
+        }
         throw std::runtime_error("unsupported encrypted data version");
+    }
 
     std::uint8_t saltLen = input[5];
     std::uint8_t macLen  = input[6];
@@ -935,10 +1014,7 @@ DecryptResult decryptPayload(const ByteVector& input,
     // parse augmented and extract plaintext
     DecryptResult result;
     result.version = version;
-    if (isV6)
-        result.plaintext = parseAugmentedV6(augmented, result.meta);
-    else
-        result.plaintext = parseAugmentedV5(augmented);
+    result.plaintext = parseAugmentedV6(augmented, result.meta);
 
     // verify MAC
     Mac256 computed = computeHardenedMac(result.plaintext, passphrase, salt1, salt2);
@@ -1110,6 +1186,330 @@ std::string trimCopy(const std::string& text) {
     return std::string(b, e);
 }
 
+#ifdef _WIN32
+std::wstring utf8ToWide(const std::string& text) {
+    if (text.empty()) return std::wstring();
+    int length = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
+    if (length <= 0) {
+        return std::wstring(text.begin(), text.end());
+    }
+    std::wstring wide(static_cast<std::size_t>(length - 1), L'\0');
+    if (!wide.empty()) {
+        MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, &wide[0], length);
+    }
+    return wide;
+}
+#endif
+
+bool parseAppVersionText(const std::string& text, AppVersion& version) {
+    std::string cleaned = trimCopy(text);
+    if (cleaned.empty()) return false;
+    if (cleaned[0] == 'v' || cleaned[0] == 'V')
+        cleaned.erase(cleaned.begin());
+
+    // parse format: MAJOR.MINOR.PATCH[pre-release]
+    const char* s = cleaned.c_str();
+    char* tail = nullptr;
+    long maj = std::strtol(s, &tail, 10);
+    if (tail == s || *tail != '.') return false;
+    s = tail + 1;
+    long min = std::strtol(s, &tail, 10);
+    if (tail == s || *tail != '.') return false;
+    s = tail + 1;
+    long pat = std::strtol(s, &tail, 10);
+    if (tail == s) return false;
+
+    std::string pre;
+    if (*tail != '\0') {
+        pre = std::string(tail);
+        // strip leading '-' if present (accept both "0.2.0-pre1" and "0.2.0pre1")
+        if (!pre.empty() && (pre[0] == '-' || pre[0] == '+')) pre.erase(pre.begin());
+        pre = trimCopy(pre);
+    }
+
+    if (maj < 0 || min < 0 || pat < 0) return false;
+    version.major = static_cast<int>(maj);
+    version.minor = static_cast<int>(min);
+    version.patch = static_cast<int>(pat);
+    version.preRelease = pre;
+    return true;
+}
+
+bool parseVersionFileText(const std::string& body,
+                          AppVersion& latestVersion,
+                          std::string& downloadUrl)
+{
+    std::istringstream input(body);
+    std::string versionLine;
+    if (!std::getline(input, versionLine))
+        return false;
+    if (!parseAppVersionText(versionLine, latestVersion))
+        return false;
+
+    std::string urlLine;
+    if (std::getline(input, urlLine))
+        downloadUrl = trimCopy(urlLine);
+    else
+        downloadUrl.clear();
+
+    if (downloadUrl.empty())
+        downloadUrl = kDefaultReleaseUrl;
+    return true;
+}
+
+std::string getVersionInfoUrl() {
+    const char* env = std::getenv("THERAPIST_VERSION_URL");
+    if (env && env[0] != '\0')
+        return trimCopy(env);
+    return kDefaultVersionInfoUrl;
+}
+
+#ifdef _WIN32
+struct WinHttpApi {
+    HMODULE module = nullptr;
+    WinHttpOpenFn open = nullptr;
+    WinHttpConnectFn connect = nullptr;
+    WinHttpOpenRequestFn openRequest = nullptr;
+    WinHttpSetTimeoutsFn setTimeouts = nullptr;
+    WinHttpSendRequestFn sendRequest = nullptr;
+    WinHttpReceiveResponseFn receiveResponse = nullptr;
+    WinHttpQueryHeadersFn queryHeaders = nullptr;
+    WinHttpQueryDataAvailableFn queryDataAvailable = nullptr;
+    WinHttpReadDataFn readData = nullptr;
+    WinHttpCloseHandleFn closeHandle = nullptr;
+
+    bool load() {
+        if (module) return true;
+        module = LoadLibraryW(L"winhttp.dll");
+        if (!module) return false;
+
+        open = reinterpret_cast<WinHttpOpenFn>(GetProcAddress(module, "WinHttpOpen"));
+        connect = reinterpret_cast<WinHttpConnectFn>(GetProcAddress(module, "WinHttpConnect"));
+        openRequest = reinterpret_cast<WinHttpOpenRequestFn>(GetProcAddress(module, "WinHttpOpenRequest"));
+        setTimeouts = reinterpret_cast<WinHttpSetTimeoutsFn>(GetProcAddress(module, "WinHttpSetTimeouts"));
+        sendRequest = reinterpret_cast<WinHttpSendRequestFn>(GetProcAddress(module, "WinHttpSendRequest"));
+        receiveResponse = reinterpret_cast<WinHttpReceiveResponseFn>(GetProcAddress(module, "WinHttpReceiveResponse"));
+        queryHeaders = reinterpret_cast<WinHttpQueryHeadersFn>(GetProcAddress(module, "WinHttpQueryHeaders"));
+        queryDataAvailable = reinterpret_cast<WinHttpQueryDataAvailableFn>(GetProcAddress(module, "WinHttpQueryDataAvailable"));
+        readData = reinterpret_cast<WinHttpReadDataFn>(GetProcAddress(module, "WinHttpReadData"));
+        closeHandle = reinterpret_cast<WinHttpCloseHandleFn>(GetProcAddress(module, "WinHttpCloseHandle"));
+
+        if (open && connect && openRequest && setTimeouts && sendRequest &&
+            receiveResponse && queryHeaders && queryDataAvailable && readData && closeHandle) {
+            return true;
+        }
+
+        FreeLibrary(module);
+        module = nullptr;
+        open = nullptr;
+        connect = nullptr;
+        openRequest = nullptr;
+        setTimeouts = nullptr;
+        sendRequest = nullptr;
+        receiveResponse = nullptr;
+        queryHeaders = nullptr;
+        queryDataAvailable = nullptr;
+        readData = nullptr;
+        closeHandle = nullptr;
+        return false;
+    }
+};
+
+bool parseHttpsUrlParts(const std::string& url,
+                        std::wstring& host,
+                        INTERNET_PORT& port,
+                        std::wstring& path)
+{
+    const std::string prefix = "https://";
+    if (url.rfind(prefix, 0) != 0)
+        return false;
+
+    std::string remainder = url.substr(prefix.size());
+    std::size_t slashPos = remainder.find('/');
+    std::string hostPort = slashPos == std::string::npos
+        ? remainder
+        : remainder.substr(0, slashPos);
+    std::string pathPart = slashPos == std::string::npos
+        ? "/"
+        : remainder.substr(slashPos);
+    if (hostPort.empty())
+        return false;
+
+    port = kInternetDefaultHttpsPort;
+    std::size_t colonPos = hostPort.rfind(':');
+    if (colonPos != std::string::npos) {
+        std::string portText = hostPort.substr(colonPos + 1);
+        hostPort = hostPort.substr(0, colonPos);
+        if (hostPort.empty() || portText.empty())
+            return false;
+        try {
+            unsigned long parsedPort = std::stoul(portText);
+            if (parsedPort == 0 || parsedPort > 65535UL)
+                return false;
+            port = static_cast<INTERNET_PORT>(parsedPort);
+        } catch (...) {
+            return false;
+        }
+    }
+
+    if (hostPort.empty())
+        return false;
+
+    host.assign(hostPort.begin(), hostPort.end());
+    path.assign(pathPart.begin(), pathPart.end());
+    return true;
+}
+
+bool fetchHttpsTextWinHttp(const std::string& url,
+                           std::string& body,
+                           std::string& error)
+{
+    std::wstring host;
+    std::wstring path;
+    INTERNET_PORT port = kInternetDefaultHttpsPort;
+    if (!parseHttpsUrlParts(url, host, port, path)) {
+        error = "invalid version URL";
+        return false;
+    }
+
+    static WinHttpApi api;
+    if (!api.load()) {
+        error = "winhttp.dll is unavailable";
+        return false;
+    }
+
+    std::wstring ua = utf8ToWide(std::string("TherapistVersionCheck/") + kAppVersionText);
+    HINTERNET session = api.open(ua.c_str(),
+                                 kWinHttpAccessTypeDefaultProxy,
+                                 nullptr,
+                                 nullptr,
+                                 0);
+    if (!session) {
+        error = "unable to start WinHTTP session";
+        return false;
+    }
+
+    bool success = false;
+    HINTERNET connect = nullptr;
+    HINTERNET request = nullptr;
+    do {
+        if (!api.setTimeouts(session,
+                             kVersionResolveTimeoutMs,
+                             kVersionConnectTimeoutMs,
+                             kVersionSendTimeoutMs,
+                             kVersionReceiveTimeoutMs)) {
+            error = "unable to set WinHTTP timeouts";
+            break;
+        }
+
+        connect = api.connect(session, host.c_str(), port, 0);
+        if (!connect) {
+            error = "unable to connect to version host";
+            break;
+        }
+
+        request = api.openRequest(connect,
+                                  L"GET",
+                                  path.c_str(),
+                                  nullptr,
+                                  nullptr,
+                                  nullptr,
+                                  kWinHttpFlagSecure);
+        if (!request) {
+            error = "unable to open HTTPS request";
+            break;
+        }
+
+        const wchar_t* headers = L"Cache-Control: no-cache\r\nPragma: no-cache\r\n";
+        if (!api.sendRequest(request,
+                             headers,
+                             static_cast<DWORD>(-1L),
+                             nullptr,
+                             0,
+                             0,
+                             0)) {
+            error = "unable to send version request";
+            break;
+        }
+        if (!api.receiveResponse(request, nullptr)) {
+            error = "unable to receive version response";
+            break;
+        }
+
+        DWORD statusCode = 0;
+        DWORD statusSize = sizeof(statusCode);
+        if (!api.queryHeaders(request,
+                              kWinHttpQueryStatusCode | kWinHttpQueryFlagNumber,
+                              nullptr,
+                              &statusCode,
+                              &statusSize,
+                              nullptr)) {
+            error = "unable to read version response status";
+            break;
+        }
+        if (statusCode != kHttpStatusOk) {
+            error = "version check returned HTTP " + std::to_string(statusCode);
+            break;
+        }
+
+        body.clear();
+        while (true) {
+            DWORD available = 0;
+            if (!api.queryDataAvailable(request, &available)) {
+                error = "unable to query version response size";
+                break;
+            }
+            if (available == 0) {
+                success = true;
+                break;
+            }
+
+            std::vector<char> buffer(available);
+            DWORD bytesRead = 0;
+            if (!api.readData(request, buffer.data(), available, &bytesRead)) {
+                error = "unable to read version response body";
+                break;
+            }
+            body.append(buffer.data(), bytesRead);
+        }
+    } while (false);
+
+    if (request) api.closeHandle(request);
+    if (connect) api.closeHandle(connect);
+    api.closeHandle(session);
+    return success;
+}
+// end of WinHTTP text-fetch implementation
+#endif
+
+// (binary download + SHA256 verification removed)
+
+void runRemoteVersionCheck() {
+    gRemoteVersionInfo = RemoteVersionInfo{};
+    gRemoteVersionInfo.checked = true;
+    gRemoteVersionInfo.versionInfoUrl = getVersionInfoUrl();
+
+    std::string body;
+    if (!fetchHttpsTextWinHttp(gRemoteVersionInfo.versionInfoUrl,
+                               body,
+                               gRemoteVersionInfo.errorMessage)) {
+        return;
+    }
+
+    AppVersion latestVersion{};
+    std::string downloadUrl;
+    if (!parseVersionFileText(body, latestVersion, downloadUrl)) {
+        gRemoteVersionInfo.errorMessage = "version file format is invalid";
+        return;
+    }
+
+    gRemoteVersionInfo.succeeded = true;
+    gRemoteVersionInfo.latestVersion = latestVersion;
+    gRemoteVersionInfo.downloadUrl = downloadUrl;
+    gRemoteVersionInfo.outdated =
+        compareAppVersion(kCurrentAppVersion, gRemoteVersionInfo.latestVersion) < 0;
+}
+
 std::string formatFileSize(std::size_t bytes) {
     std::ostringstream oss;
     if (bytes < 1024)
@@ -1269,7 +1669,8 @@ void clearConsole(bool ansi) {
 
 void applyConsoleTitle() {
 #ifdef _WIN32
-    SetConsoleTitleW(L"therapist");
+    std::wstring title = utf8ToWide(kAppExeName);
+    SetConsoleTitleW(title.c_str());
 #endif
 }
 
@@ -1548,9 +1949,9 @@ bool runSelfTest(bool verbose) {
         if (verbose) printSection(name);
     };
 
-    const std::string pass = "therapist-selftest";
+    const std::string pass = std::string(kAppExeName) + "-selftest";
 
-    // ── s-box & primitives ──
+    // -- s-box & primitives --
 
     category("s-box & primitives");
 
@@ -1594,7 +1995,7 @@ bool runSelfTest(bool verbose) {
         }
     });
 
-    // ── block cipher ──
+    // -- block cipher --
 
     category("block cipher");
 
@@ -1606,8 +2007,8 @@ bool runSelfTest(bool verbose) {
         ScopedKS w(ks);
         std::uint64_t L1 = 0x0123456789ABCDEFULL, R1 = 0xFEDCBA9876543210ULL;
         std::uint64_t L2 = L1, R2 = R1;
-        encryptBlockV5(L1, R1, ks);
-        encryptBlockV5(L2, R2, ks);
+        encryptBlock(L1, R1, ks);
+        encryptBlock(L2, R2, ks);
         if (L1 != L2 || R1 != R2)
             throw std::runtime_error("same input gave different output");
     });
@@ -1620,7 +2021,7 @@ bool runSelfTest(bool verbose) {
         ScopedKS w(ks);
         std::uint64_t L = 0x0123456789ABCDEFULL, R = 0xFEDCBA9876543210ULL;
         std::uint64_t origL = L, origR = R;
-        encryptBlockV5(L, R, ks);
+        encryptBlock(L, R, ks);
         if (L == origL && R == origR)
             throw std::runtime_error("encrypted == plaintext");
     });
@@ -1633,8 +2034,8 @@ bool runSelfTest(bool verbose) {
         ScopedKS w(ks);
         std::uint64_t L1 = 0xAAAAAAAAAAAAAAAAULL, R1 = 0x5555555555555555ULL;
         std::uint64_t L2 = L1 ^ 1ULL, R2 = R1;
-        encryptBlockV5(L1, R1, ks);
-        encryptBlockV5(L2, R2, ks);
+        encryptBlock(L1, R1, ks);
+        encryptBlock(L2, R2, ks);
         std::uint64_t dL = L1 ^ L2, dR = R1 ^ R2;
         int bits = 0;
         while (dL) { bits += static_cast<int>(dL & 1ULL); dL >>= 1; }
@@ -1643,7 +2044,7 @@ bool runSelfTest(bool verbose) {
             throw std::runtime_error("only " + std::to_string(bits) + "/128 bits changed");
     });
 
-    // ── ctr mode ──
+    // -- ctr mode --
 
     category("ctr mode");
 
@@ -1678,7 +2079,7 @@ bool runSelfTest(bool verbose) {
             throw std::runtime_error("different salts produced same ciphertext");
     });
 
-    // ── key derivation ──
+    // -- key derivation --
 
     category("key derivation");
 
@@ -1707,7 +2108,7 @@ bool runSelfTest(bool verbose) {
             throw std::runtime_error("different salts produced same keys");
     });
 
-    // ── mac ──
+    // -- mac --
 
     category("mac");
 
@@ -1735,7 +2136,7 @@ bool runSelfTest(bool verbose) {
             throw std::runtime_error("different input produced same MAC");
     });
 
-    // ── payload round-trips ──
+    // -- payload round-trips --
 
     category("payload round-trips");
 
@@ -1866,7 +2267,7 @@ bool runSelfTest(bool verbose) {
             throw std::runtime_error("two encryptions are identical");
     });
 
-    // ── authentication & tamper ──
+    // -- authentication & tamper --
 
     category("authentication & tamper");
 
@@ -1935,7 +2336,7 @@ bool runSelfTest(bool verbose) {
             throw std::runtime_error("wrong magic accepted");
     });
 
-    // ── counter ──
+    // -- counter --
 
     category("counter");
 
@@ -1959,7 +2360,7 @@ bool runSelfTest(bool verbose) {
             throw std::runtime_error("carry failed");
     });
 
-    // ── file i/o ──
+    // -- file i/o --
 
     category("file i/o");
 
@@ -1992,7 +2393,7 @@ bool runSelfTest(bool verbose) {
             throw std::runtime_error("file data mismatch");
     });
 
-    // ── message layer ──
+    // -- message layer --
 
     category("message layer");
 
@@ -2031,6 +2432,25 @@ bool runSelfTest(bool verbose) {
             throw std::runtime_error("message mismatch after decrypt");
     });
 
+    // -- version metadata --
+
+    category("version metadata");
+
+    runTest("version file parse",
+            "parsed semantic version + release URL from plain text update metadata",
+    [&]() {
+        AppVersion latest{};
+        std::string downloadUrl;
+        std::string manifest = std::string(kAppVersionText) + "\n" + kDefaultReleaseUrl + "\n";
+        if (!parseVersionFileText(manifest, latest, downloadUrl)) {
+            throw std::runtime_error("version file parse failed");
+        }
+        if (formatAppVersion(latest) != kAppVersionText)
+            throw std::runtime_error("version mismatch");
+        if (downloadUrl.find("github.com/ytaxx/TherapistEncrypter/releases") == std::string::npos)
+            throw std::runtime_error("download URL mismatch");
+    });
+
     // cleanup
     std::remove("selftest_input.tmp");
     std::remove("selftest_enc.tmp");
@@ -2043,8 +2463,8 @@ bool runSelfTest(bool verbose) {
         std::cout << std::endl;
         printDivider();
         std::cout << std::endl;
-        printNote("cipher:   feistel V5/V6, " + std::to_string(kRounds) + " rounds, "
-                  + std::to_string(kBlockSize) + "-byte block, double-pass CTR");
+        printNote("cipher:   feistel V6, " + std::to_string(kRounds) + " rounds, "
+              + std::to_string(kBlockSize) + "-byte block, double-pass CTR");
         printNote("kdf:      " + std::to_string(savedIter) + " iterations, "
                   + formatFileSize(savedMem) + " memory");
         printNote("mac:      256-bit cascaded (4x FNV-like)");
@@ -2082,6 +2502,64 @@ bool parseSizeWithSuffix(const std::string& s, std::size_t& out) {
     } catch (...) { return false; }
 }
 
+
+void showOutdatedVersionWarning(bool ansi) {
+#ifdef _WIN32
+    // only proceed if we successfully queried a remote version
+    if (!gRemoteVersionInfo.checked || !gRemoteVersionInfo.succeeded) return;
+    // if not outdated, do not block the user - the main menu will print a green status
+    if (!gRemoteVersionInfo.outdated) return;
+#else
+    if (!isProgramOutdated()) return;
+#endif
+#ifdef _WIN32
+    std::string latest = formatAppVersion(gRemoteVersionInfo.latestVersion);
+    std::string current = formatAppVersion(kCurrentAppVersion);
+    std::string popupText = std::string("This build is outdated.\n\n") +
+        "You're using " + current + "\n" +
+        "Latest available: " + latest + "\n\n" +
+        "Please download the latest version from:\n" +
+        (gRemoteVersionInfo.downloadUrl.empty() ? std::string(kDefaultReleaseUrl) : gRemoteVersionInfo.downloadUrl) +
+        "\n\nThis message will also appear in the console.";
+    // try to disable console input / echo while the popup is visible so
+    // keystrokes typed by the user while the dialog is open are not buffered
+    HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD prevMode = 0;
+    bool modeSaved = false;
+    if (hIn != INVALID_HANDLE_VALUE && GetConsoleMode(hIn, &prevMode)) {
+        modeSaved = true;
+        DWORD newMode = prevMode & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
+        SetConsoleMode(hIn, newMode);
+    }
+
+    // show top-most popup and request foreground to improve focus behavior
+    MessageBoxW(nullptr,
+                utf8ToWide(popupText).c_str(),
+                utf8ToWide(std::string(kAppExeName) + " update warning").c_str(),
+                MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST);
+
+    // flush any buffered input and restore previous console mode
+    if (hIn != INVALID_HANDLE_VALUE) {
+        FlushConsoleInputBuffer(hIn);
+        if (modeSaved) SetConsoleMode(hIn, prevMode);
+    }
+#endif
+    clearConsole(ansi);
+    printBanner();
+    printDivider();
+    printSection("update warning");
+    // keep console output minimal: advise user to download latest and provide
+    // the URL here (the popup intentionally omits the direct link)
+    printWarn("program is outdated, you're using " + current + " please download the latest version");
+    if (!gRemoteVersionInfo.downloadUrl.empty())
+        printNote("download: " + gRemoteVersionInfo.downloadUrl);
+    std::cout << std::endl;
+    printDivider();
+    std::cout << std::endl;
+    printPrompt("press enter to continue:");
+    std::string dummy;
+    std::getline(std::cin, dummy);
+}
 void loadKdfOverrides() {
     if (const char* e = std::getenv("THERAPIST_KDF_ITERATIONS")) {
         try { std::size_t v = static_cast<std::size_t>(std::stoull(e)); if (v > 0) gKdfIterations = v; } catch (...) {}
@@ -2356,7 +2834,7 @@ bool checkPasswordAcceptable(std::string& passphrase) {
                 if (yn == "y" || yn == "Y") return true;
             }
 
-            // user declined — offer to enter a new password instead of returning to menu
+            // user declined � offer to enter a new password instead of returning to menu
             printPrompt("enter a new passphrase (leave empty to cancel):");
             std::string newp;
             if (!std::getline(std::cin, newp)) return false;
@@ -2373,6 +2851,24 @@ bool checkPasswordAcceptable(std::string& passphrase) {
 void syncSettingsToGlobals() {
     gKdfIterations  = gSettings.kdfIterations;
     gKdfMemoryBytes = gSettings.kdfMemoryBytes;
+}
+
+void setChaffMinSetting(std::size_t value, bool& adjustedMax) {
+    adjustedMax = false;
+    gSettings.chaffMin = value;
+    if (gSettings.chaffMin > gSettings.chaffMax) {
+        gSettings.chaffMax = gSettings.chaffMin;
+        adjustedMax = true;
+    }
+}
+
+void setChaffMaxSetting(std::size_t value, bool& adjustedMin) {
+    adjustedMin = false;
+    gSettings.chaffMax = value;
+    if (gSettings.chaffMax < gSettings.chaffMin) {
+        gSettings.chaffMin = gSettings.chaffMax;
+        adjustedMin = true;
+    }
 }
 
 } // namespace therapist
@@ -2486,6 +2982,19 @@ int main(int argc, char* argv[]) {
         clearConsole(ansi);
     };
 
+    // initialize current app version from env or compiled default string
+    {
+        const char* envv = std::getenv("THERAPIST_CURRENT_VERSION");
+        std::string cur = envv && envv[0] ? trimCopy(std::string(envv)) : std::string(kCurrentVersionText);
+        AppVersion parsed{0,0,0, std::string()};
+        if (parseAppVersionText(cur, parsed)) {
+            kCurrentAppVersion = parsed;
+        }
+    }
+
+    runRemoteVersionCheck();
+    showOutdatedVersionWarning(ansi);
+
     while (true) {
         try {
             clearConsole(ansi);
@@ -2502,6 +3011,14 @@ int main(int argc, char* argv[]) {
             std::cout << std::endl;
             printDivider();
             std::cout << std::endl;
+            if (gRemoteVersionInfo.checked && gRemoteVersionInfo.succeeded) {
+                if (gRemoteVersionInfo.outdated) {
+                    printWarn("program is outdated, you're using " + formatAppVersion(kCurrentAppVersion) + " please download the latest version");
+                } else {
+                    printOk("program is up to date, you're using " + formatAppVersion(kCurrentAppVersion));
+                }
+                std::cout << std::endl;
+            }
             printPrompt("choose:");
             std::string choice;
             if (!std::getline(std::cin, choice)) break;
@@ -2882,8 +3399,11 @@ int main(int argc, char* argv[]) {
                             try {
                                 std::size_t n = std::stoull(v);
                                 if (n >= 1 && n <= 512) {
-                                    gSettings.chaffMin = n;
+                                    bool adjustedMax = false;
+                                    setChaffMinSetting(n, adjustedMax);
                                     printOk("chaff min set to " + std::to_string(n));
+                                    if (adjustedMax)
+                                        printWarn("chaff max was raised to match the new minimum");
                                 } else printFail("range: 1-512");
                             } catch (...) { printFail("invalid number"); }
                         }
@@ -2894,8 +3414,11 @@ int main(int argc, char* argv[]) {
                             try {
                                 std::size_t n = std::stoull(v);
                                 if (n >= 1 && n <= 1024) {
-                                    gSettings.chaffMax = n;
+                                    bool adjustedMin = false;
+                                    setChaffMaxSetting(n, adjustedMin);
                                     printOk("chaff max set to " + std::to_string(n));
+                                    if (adjustedMin)
+                                        printWarn("chaff min was lowered to match the new maximum");
                                 } else printFail("range: 1-1024");
                             } catch (...) { printFail("invalid number"); }
                         }
@@ -2973,3 +3496,4 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
+
