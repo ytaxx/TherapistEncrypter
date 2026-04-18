@@ -62,10 +62,11 @@ using WinHttpCloseHandleFn = BOOL (WINAPI*)(HINTERNET);
 #include <utime.h>
 #endif
 
-
-// the newly added comments made by AI, I was lazy to explain things more
-
 namespace therapist {
+
+// the newly added comments made by AI, I was lazy to explain things more (commit 55d34d0)
+
+
 // ---------------------------------------------------------------------------
 //  types
 // ---------------------------------------------------------------------------
@@ -89,7 +90,7 @@ struct RemoteVersionInfo {
     bool checked = false;
     bool succeeded = false;
     bool outdated = false;
-    AppVersion latestVersion{0, 0, 0};
+    AppVersion latestVersion{0, 0, 0, ""};
     std::string downloadUrl;
     std::string versionInfoUrl;
     std::string errorMessage;
@@ -364,29 +365,52 @@ inline std::uint64_t applySBoxToWord(std::uint64_t w, const SBoxPair& sb) { // a
 //  csprng (os entropy - no std::random_device)
 // ---------------------------------------------------------------------------
 // fill buffer with cryptographically secure random bytes.
-// uses os crypto api on windows (systemfunction036) or /dev/urandom on unix.
+// uses BCryptGenRandom (preferred) or RtlGenRandom (fallback) on windows,
+// or /dev/urandom on unix.
 // this is the single point of entropy for the program.
 // does not use std::random_device because it is not guaranteed secure.
 inline void fillCryptoRandom(std::uint8_t* buf, std::size_t len) {
     if (len == 0) return;
 #ifdef _WIN32
+    // --- primary: BCryptGenRandom (available on Vista+/Server 2008+) ---
+    using BCryptGenRandomPtr = LONG(WINAPI*)(PVOID, PUCHAR, ULONG, ULONG);
+    static BCryptGenRandomPtr bcryptFn = []() -> BCryptGenRandomPtr {
+        HMODULE mod = GetModuleHandleW(L"bcrypt.dll");
+        if (!mod) mod = LoadLibraryW(L"bcrypt.dll");
+        if (!mod) return nullptr;
+        return reinterpret_cast<BCryptGenRandomPtr>(
+            GetProcAddress(mod, "BCryptGenRandom"));
+    }();
+    constexpr ULONG BCRYPT_USE_SYSTEM_PREFERRED_RNG = 0x00000002;
+    if (bcryptFn) {
+        std::size_t off = 0;
+        while (off < len) {
+            ULONG chunk = static_cast<ULONG>(
+                std::min<std::size_t>(len - off, 0xFFFFFFFFUL));
+            LONG status = bcryptFn(nullptr, buf + off, chunk,
+                                   BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+            if (status < 0) // NTSTATUS failure
+                throw std::runtime_error("BCryptGenRandom failed");
+            off += chunk;
+        }
+        return;
+    }
+    // --- fallback: RtlGenRandom (SystemFunction036 in advapi32) ---
     using RtlGenRandomPtr = BOOLEAN(WINAPI*)(PVOID, ULONG);
-    static RtlGenRandomPtr fn = []() -> RtlGenRandomPtr {
+    static RtlGenRandomPtr rtlFn = []() -> RtlGenRandomPtr {
         HMODULE mod = GetModuleHandleW(L"advapi32.dll");
         if (!mod) mod = LoadLibraryW(L"advapi32.dll");
         if (!mod) return nullptr;
         return reinterpret_cast<RtlGenRandomPtr>(
             GetProcAddress(mod, "SystemFunction036"));
     }();
-    // if windows api resolved, use it as primary entropy source
-    if (fn) {
+    if (rtlFn) {
         std::size_t off = 0;
         while (off < len) {
             ULONG chunk = static_cast<ULONG>(
                 std::min<std::size_t>(len - off, 0xFFFFFFFFUL));
-            // fill in chunks to respect ULONG size limits
-            if (!fn(buf + off, chunk))
-                throw std::runtime_error("RtlGenRandom failed"); // fn returns nonzero on success
+            if (!rtlFn(buf + off, chunk))
+                throw std::runtime_error("RtlGenRandom failed");
             off += chunk;
         }
         return;
@@ -459,14 +483,20 @@ inline void* alignedAlloc(std::size_t align, std::size_t sz) {
 }
 inline void alignedFree(void* p) { if (p) _aligned_free(p); }
 #elif defined(_WIN32)
-// MinGW: manual alignment via overallocation
+// MinGW: safe manual alignment via overallocation with overflow checks
 inline void* alignedAlloc(std::size_t align, std::size_t sz) {
     if (align < sizeof(void*)) align = sizeof(void*);
-    std::size_t total = sz + align + sizeof(void*);
+    // ensure alignment is a power of two
+    if ((align & (align - 1)) != 0) return nullptr;
+    // check for overflow before computing total allocation size
+    std::size_t overhead = align + sizeof(void*);
+    if (sz > SIZE_MAX - overhead) return nullptr;
+    std::size_t total = sz + overhead;
     void* raw = std::malloc(total);
     if (!raw) return nullptr;
-    void** aligned = reinterpret_cast<void**>(
-        (reinterpret_cast<std::uintptr_t>(raw) + sizeof(void*) + align - 1) & ~(align - 1));
+    std::uintptr_t rawAddr = reinterpret_cast<std::uintptr_t>(raw) + sizeof(void*);
+    std::uintptr_t alignedAddr = (rawAddr + align - 1) & ~(align - 1);
+    void** aligned = reinterpret_cast<void**>(alignedAddr);
     aligned[-1] = raw;
     return aligned;
 }
@@ -588,7 +618,11 @@ HardenedKeySchedule deriveHardenedSchedule(const std::string& pass,
         }
 
     // phase 2: expand into scratch buffer
-    std::size_t memBytes = (gKdfMemoryBytes / 8U) * 8U;
+    // clamp to a sane upper bound (2 GiB) to prevent OOM from misconfiguration
+    constexpr std::size_t kKdfMemMax = std::size_t{2} * 1024 * 1024 * 1024;
+    std::size_t rawMem = gKdfMemoryBytes;
+    if (rawMem > kKdfMemMax) rawMem = kKdfMemMax;
+    std::size_t memBytes = (rawMem / 8U) * 8U;
     const std::size_t words = memBytes / 8U;
     if (words <= 8U) throw std::invalid_argument("KDF memory too small");
 
@@ -1783,8 +1817,24 @@ bool enableAnsiColors() {
 
 void clearConsole(bool ansi) {
 #ifdef _WIN32
-    if (ansi) std::cout << "\033[2J\033[3J\033[H" << std::flush;
-    else std::system("cls");
+    if (ansi) {
+        std::cout << "\033[2J\033[3J\033[H" << std::flush;
+    } else {
+        // native console API instead of system("cls")
+        HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (hOut != INVALID_HANDLE_VALUE) {
+            CONSOLE_SCREEN_BUFFER_INFO csbi;
+            if (GetConsoleScreenBufferInfo(hOut, &csbi)) {
+                DWORD cells = static_cast<DWORD>(csbi.dwSize.X) *
+                              static_cast<DWORD>(csbi.dwSize.Y);
+                COORD origin = {0, 0};
+                DWORD written = 0;
+                FillConsoleOutputCharacterA(hOut, ' ', cells, origin, &written);
+                FillConsoleOutputAttribute(hOut, csbi.wAttributes, cells, origin, &written);
+                SetConsoleCursorPosition(hOut, origin);
+            }
+        }
+    }
 #else
     (void)ansi;
     std::cout << "\033[2J\033[3J\033[H" << std::flush;
@@ -2690,12 +2740,18 @@ void showOutdatedVersionWarning(bool ansi) {
     std::getline(std::cin, dummy);
 }
 void loadKdfOverrides() {
+    constexpr std::size_t kMaxIterations = 100000000; // 100 M
+    constexpr std::size_t kMaxMemory = std::size_t{2} * 1024 * 1024 * 1024; // 2 GiB
     if (const char* e = std::getenv("THERAPIST_KDF_ITERATIONS")) {
-        try { std::size_t v = static_cast<std::size_t>(std::stoull(e)); if (v > 0) gKdfIterations = v; } catch (...) {}
+        try {
+            std::size_t v = static_cast<std::size_t>(std::stoull(e));
+            if (v > 0) gKdfIterations = std::min(v, kMaxIterations);
+        } catch (...) {}
     }
     if (const char* e = std::getenv("THERAPIST_KDF_MEMORY_BYTES")) {
         std::size_t v = 0;
-        if (parseSizeWithSuffix(std::string(e), v) && v > 0) gKdfMemoryBytes = v;
+        if (parseSizeWithSuffix(std::string(e), v) && v > 0)
+            gKdfMemoryBytes = std::min(v, kMaxMemory);
     }
 }
 
@@ -3022,12 +3078,14 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; ++i) {
         std::string a(argv[i]);
         if (a.rfind("--kdf-iterations=", 0) == 0) {
-            try { std::size_t v = std::stoull(a.substr(17)); if (v > 0) gKdfIterations = v; } catch (...) {}
+            constexpr std::size_t kMaxIter = 100000000;
+            try { std::size_t v = std::stoull(a.substr(17)); if (v > 0) gKdfIterations = std::min(v, kMaxIter); } catch (...) {}
             continue;
         }
         if (a.rfind("--kdf-memory=", 0) == 0) {
+            constexpr std::size_t kMaxMem = std::size_t{2} * 1024 * 1024 * 1024;
             std::size_t v = 0;
-            if (parseSizeWithSuffix(a.substr(13), v) && v > 0) gKdfMemoryBytes = v;
+            if (parseSizeWithSuffix(a.substr(13), v) && v > 0) gKdfMemoryBytes = std::min(v, kMaxMem);
             continue;
         }
         if (a == "--self-test") { requestSelfTest = true; continue; }
