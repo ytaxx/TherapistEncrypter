@@ -64,17 +64,33 @@ using WinHttpCloseHandleFn = BOOL (WINAPI*)(HINTERNET);
 
 namespace therapist {
 
+// general notes:
+// - most comments are lowercase to keep a consistent style.
+// - avoid capital letters unless they help understanding (for example: CSPRNG, OS).
+// - avoid using emdash characters; use simple hyphen "-" when separating phrases.
+// - this file contains: constants, settings, s-box, primitive helpers, csprng,
+//   secure memory helpers, key schedule, block cipher implementation, ctr mode,
+//   mac computation, payload augmentation/parsing, file i/o, network/version checks,
+//   and console/ui helpers.
+// - when editing cryptographic code, do not change algorithms or constants
+//   without a clear security review and tests. treat the algorithms as sensitive.
+// - memory handling functions try to zero and lock sensitive buffers where possible.
+// - use the existing helper functions (securezero, securewipe, scopedbuffer)
+//   rather than rolling your own buffer handling.
+// - keep comments focused on why and how, not just what; prefer short, clear notes.
+
+
 // ---------------------------------------------------------------------------
 //  types
 // ---------------------------------------------------------------------------
-using ByteVector = std::vector<std::uint8_t>;
+using ByteVector = std::vector<std::uint8_t>; // alias for binary buffers (vector of bytes)
 
 // ---------------------------------------------------------------------------
 //  constants
 // ---------------------------------------------------------------------------
 // v6 (current default -- adds embedded filename + date)
-constexpr std::array<std::uint8_t, 4> kMagicV6 = {'T', 'P', 'C', '6'};
-constexpr std::uint8_t kVersionV6 = 6;
+constexpr std::array<std::uint8_t, 4> kMagicV6 = {'T', 'P', 'C', '6'}; // file format magic for v6
+constexpr std::uint8_t kVersionV6 = 6; // version byte for v6 format
 
 struct AppVersion {
     int major;
@@ -94,10 +110,10 @@ struct RemoteVersionInfo {
     // (SHA256 verification removed)
 };
 
-// Application identity / version (single edit point)
+// application identity / version (single edit point)
 constexpr const char* kAppExeName = "therapist";
 constexpr const char* kAppVersionText = "0.2.0pre3"; // update this one place for compiled default
-// Default current version text. You can override at runtime with
+// default current version text. you can override at runtime with
 // the THERAPIST_CURRENT_VERSION environment variable
 constexpr const char* kCurrentVersionText = kAppVersionText;
 static AppVersion kCurrentAppVersion{0, 0, 0, ""};
@@ -252,31 +268,31 @@ inline void initSymbols() {
 //  s-box (256-byte permutation, deterministic PRNG)
 // ---------------------------------------------------------------------------
 struct SBoxPair {
-    std::array<std::uint8_t, 256> fwd;
-    std::array<std::uint8_t, 256> inv;
-    std::array<std::array<std::uint64_t, 256>, 8> fwd64{};
+    std::array<std::uint8_t, 256> fwd; // forward permutation s-box (byte -> byte)
+    std::array<std::uint8_t, 256> inv; // inverse permutation for undoing s-box
+    std::array<std::array<std::uint64_t, 256>, 8> fwd64{}; // precomputed 64-bit lane values
 };
 
 inline SBoxPair buildSBoxPair() {
     SBoxPair p;
     for (int i = 0; i < 256; ++i)
-        p.fwd[static_cast<std::size_t>(i)] = static_cast<std::uint8_t>(i);
-    std::uint32_t rng = 0x7A3B9E1DU;
+        p.fwd[static_cast<std::size_t>(i)] = static_cast<std::uint8_t>(i); // initialize identity permutation
+    std::uint32_t rng = 0x7A3B9E1DU; // lcg seed used for deterministic shuffle
     for (int i = 255; i > 0; --i) {
-        rng = rng * 1103515245U + 12345U;
+        rng = rng * 1103515245U + 12345U; // advance lcg
         int j = static_cast<int>(((rng >> 16) & 0x7FFFU) %
-                                 static_cast<unsigned>(i + 1));
+                                 static_cast<unsigned>(i + 1)); // pick index from 0..i
         std::swap(p.fwd[static_cast<std::size_t>(i)],
-                  p.fwd[static_cast<std::size_t>(j)]);
+                  p.fwd[static_cast<std::size_t>(j)]); // swap to shuffle
     }
     for (int i = 0; i < 256; ++i)
         p.inv[p.fwd[static_cast<std::size_t>(i)]] =
-            static_cast<std::uint8_t>(i);
+            static_cast<std::uint8_t>(i); // build inverse mapping
     for (int lane = 0; lane < 8; ++lane) {
         const unsigned shift = static_cast<unsigned>(lane * 8U);
         for (int b = 0; b < 256; ++b)
             p.fwd64[static_cast<std::size_t>(lane)][static_cast<std::size_t>(b)] =
-                static_cast<std::uint64_t>(p.fwd[static_cast<std::size_t>(b)]) << shift;
+                static_cast<std::uint64_t>(p.fwd[static_cast<std::size_t>(b)]) << shift; // precompute lane shifted values
     }
     return p;
 }
@@ -289,7 +305,7 @@ inline const SBoxPair& sbox() {
 // ---------------------------------------------------------------------------
 //  primitive helpers
 // ---------------------------------------------------------------------------
-inline std::uint64_t rotl64(std::uint64_t v, unsigned s) {
+inline std::uint64_t rotl64(std::uint64_t v, unsigned s) { // rotate-left 64-bit
     s &= 63U;
     return s ? (v << s) | (v >> (64U - s)) : v;
 }
@@ -321,7 +337,7 @@ static inline std::uint64_t bswap64(std::uint64_t x) {
 #define PLATFORM_LE 0
 #endif
 
-inline std::uint64_t load64LE(const std::uint8_t* d) {
+inline std::uint64_t load64LE(const std::uint8_t* d) { // load 64-bit little-endian into host-order
     std::uint64_t v;
     std::memcpy(&v, d, 8);
 #if PLATFORM_LE
@@ -331,7 +347,7 @@ inline std::uint64_t load64LE(const std::uint8_t* d) {
 #endif
 }
 
-inline void store64LE(std::uint8_t* d, std::uint64_t v) {
+inline void store64LE(std::uint8_t* d, std::uint64_t v) { // store 64-bit value as little-endian bytes
 #if PLATFORM_LE
     std::memcpy(d, &v, 8);
 #else
@@ -340,27 +356,31 @@ inline void store64LE(std::uint8_t* d, std::uint64_t v) {
 #endif
 }
 
-inline void incrementCounter(std::array<std::uint8_t, kBlockSize>& ctr) {
+inline void incrementCounter(std::array<std::uint8_t, kBlockSize>& ctr) { // increment 128-bit counter stored as two 64-bit little-endian words
     std::uint64_t lo = load64LE(ctr.data());
     std::uint64_t hi = load64LE(ctr.data() + 8);
-    ++lo;
-    if (lo == 0ULL) ++hi;
+    ++lo; // low word increments first
+    if (lo == 0ULL) ++hi; // propagate carry to high word
     store64LE(ctr.data(), lo);
     store64LE(ctr.data() + 8, hi);
 }
 
-inline std::uint64_t applySBoxToWord(std::uint64_t w, const SBoxPair& sb) {
+inline std::uint64_t applySBoxToWord(std::uint64_t w, const SBoxPair& sb) { // apply s-box to each byte lane using precomputed fwd64
     std::uint64_t r = 0;
     for (unsigned i = 0; i < 8U; ++i) {
-        std::uint8_t b = static_cast<std::uint8_t>((w >> (i * 8U)) & 0xFFU);
-        r |= sb.fwd64[i][static_cast<std::size_t>(b)];
+        std::uint8_t b = static_cast<std::uint8_t>((w >> (i * 8U)) & 0xFFU); // extract byte i
+        r |= sb.fwd64[i][static_cast<std::size_t>(b)]; // or in pre-shifted substitution value
     }
     return r;
 }
 
 // ---------------------------------------------------------------------------
-//  CSPRNG (OS entropy -- no std::random_device)
+//  csprng (os entropy - no std::random_device)
 // ---------------------------------------------------------------------------
+// fill buffer with cryptographically secure random bytes.
+// uses os crypto api on windows (systemfunction036) or /dev/urandom on unix.
+// this is the single point of entropy for the program.
+// does not use std::random_device because it is not guaranteed secure.
 inline void fillCryptoRandom(std::uint8_t* buf, std::size_t len) {
     if (len == 0) return;
 #ifdef _WIN32
@@ -372,18 +392,21 @@ inline void fillCryptoRandom(std::uint8_t* buf, std::size_t len) {
         return reinterpret_cast<RtlGenRandomPtr>(
             GetProcAddress(mod, "SystemFunction036"));
     }();
+    // if windows api resolved, use it as primary entropy source
     if (fn) {
         std::size_t off = 0;
         while (off < len) {
             ULONG chunk = static_cast<ULONG>(
                 std::min<std::size_t>(len - off, 0xFFFFFFFFUL));
+            // fill in chunks to respect ULONG size limits
             if (!fn(buf + off, chunk))
-                throw std::runtime_error("RtlGenRandom failed");
+                throw std::runtime_error("RtlGenRandom failed"); // fn returns nonzero on success
             off += chunk;
         }
         return;
     }
 #else
+    // fallback on unix-like systems: read from /dev/urandom
     std::ifstream urand("/dev/urandom", std::ios::binary);
     if (urand) {
         urand.read(reinterpret_cast<char*>(buf),
@@ -395,18 +418,27 @@ inline void fillCryptoRandom(std::uint8_t* buf, std::size_t len) {
 }
 
 inline ByteVector generateSalt(std::size_t size) {
+    // generate a random salt of the requested size
+    // returns a byte vector filled with secure random bytes
     ByteVector salt(size);
-    fillCryptoRandom(salt.data(), size);
+    fillCryptoRandom(salt.data(), size); // fill salt bytes from csprng
     return salt;
 }
 
 // ---------------------------------------------------------------------------
 //  secure memory helpers
 // ---------------------------------------------------------------------------
+// secureZero: overwrite a memory region with zeros using a volatile pointer
+// to reduce the chance the compiler optimizes the wipe away.
+// secureWipe: helper wrappers to clear ByteVector and std::string instances
+// and shrink capacity where possible.
+// lockMemory / unlockMemory: try to pin pages to avoid swapping sensitive data
+// to disk; behavior depends on the underlying OS implementation.
 inline void secureZero(void* p, std::size_t n) {
     if (!p || n == 0) return;
+    // use volatile pointer to reduce chance compiler elides zeroing
     volatile std::uint8_t* vp = reinterpret_cast<volatile std::uint8_t*>(p);
-    for (std::size_t i = 0; i < n; ++i) vp[i] = 0;
+    for (std::size_t i = 0; i < n; ++i) vp[i] = 0; // overwrite each byte with zero
 }
 
 inline void secureWipe(ByteVector& v) {
@@ -419,17 +451,17 @@ inline void secureWipe(std::string& s) {
 
 inline bool lockMemory(void* p, std::size_t sz) {
 #ifdef _WIN32
-    return VirtualLock(p, static_cast<SIZE_T>(sz)) != 0;
+    return VirtualLock(p, static_cast<SIZE_T>(sz)) != 0; // try to pin pages on windows
 #else
-    return mlock(p, sz) == 0;
+    return mlock(p, sz) == 0; // try to lock memory on unix-like systems
 #endif
 }
 
 inline void unlockMemory(void* p, std::size_t sz) {
 #ifdef _WIN32
-    VirtualUnlock(p, static_cast<SIZE_T>(sz));
+    VirtualUnlock(p, static_cast<SIZE_T>(sz)); // release pinned pages on windows
 #else
-    munlock(p, sz);
+    munlock(p, sz); // release lock on unix-like systems
 #endif
 }
 
@@ -475,7 +507,11 @@ inline void prefetchRange(const void* p, std::size_t sz) {
 inline void prefetchRange(const void*, std::size_t) {}
 #endif
 
-// RAII aligned buffer with optional memory lock and guaranteed zero-on-destruct
+// raii aligned buffer with optional memory lock and guaranteed zero-on-destruct
+// - constructs an aligned memory block of the requested size and alignment
+// - optionally attempts to lock the pages into memory to reduce swapping
+// - on destruction the buffer is zeroed, unlocked, and freed
+// - throws std::bad_alloc if allocation fails
 struct ScopedBuffer {
     void* ptr = nullptr;
     std::size_t size = 0;
@@ -492,9 +528,9 @@ struct ScopedBuffer {
 
     ~ScopedBuffer() {
         if (ptr) {
-            secureZero(ptr, size);
-            if (locked) unlockMemory(ptr, size);
-            alignedFree(ptr);
+            secureZero(ptr, size); // wipe buffer before freeing
+            if (locked) unlockMemory(ptr, size); // unlock if we pinned pages
+            alignedFree(ptr); // free aligned allocation
         }
     }
 
@@ -505,6 +541,9 @@ struct ScopedBuffer {
 // ---------------------------------------------------------------------------
 //  key schedule
 // ---------------------------------------------------------------------------
+// hardened key schedule holds per-round subkeys and mac seeds
+// - rka, rkb, rkc: arrays of 64-bit round keys (one entry per round)
+// - macSeeds: seeds used to initialize the mac computation lanes
 struct HardenedKeySchedule {
     std::array<std::uint64_t, 32> rka{};
     std::array<std::uint64_t, 32> rkb{};
@@ -512,7 +551,7 @@ struct HardenedKeySchedule {
     std::array<std::uint64_t, 4>  macSeeds{};
 };
 
-// RAII wiper for HardenedKeySchedule
+// raii wiper for HardenedKeySchedule
 struct ScopedKS {
     HardenedKeySchedule& ks;
     explicit ScopedKS(HardenedKeySchedule& k) : ks(k) {}
@@ -522,6 +561,13 @@ struct ScopedKS {
 };
 
 // memory-hard key derivation
+// derive a hardened key schedule from a password and a salt.
+// phases:
+// - phase 1: mix password and salt into a small internal state.
+// - phase 2: expand that state into a large scratch buffer to consume memory.
+// - phase 3: run many iterations of memory-hard mixing to slow down attackers.
+// - phase 4: extract round keys and mac seeds into the returned schedule.
+// sensitive intermediate state is zeroed before returning.
 HardenedKeySchedule deriveHardenedSchedule(const std::string& pass,
                                            const ByteVector& salt)
 {
@@ -545,9 +591,9 @@ HardenedKeySchedule deriveHardenedSchedule(const std::string& pass,
     stir(static_cast<std::uint8_t>((salt.size() >> 8U) & 0xFFU), 3);
 
     for (std::size_t i = 0; i < pass.size(); ++i)
-        stir(static_cast<std::uint8_t>(pass[i]), i + 4U);
+        stir(static_cast<std::uint8_t>(pass[i]), i + 4U); // mix each password byte into state
     for (std::size_t i = 0; i < salt.size(); ++i)
-        stir(salt[i], i + pass.size() + 4U);
+        stir(salt[i], i + pass.size() + 4U); // mix each salt byte into state
 
     for (int p = 0; p < 3; ++p)
         for (int j = 0; j < 8; ++j) {
@@ -567,11 +613,13 @@ HardenedKeySchedule deriveHardenedSchedule(const std::string& pass,
     std::uint64_t* mem = static_cast<std::uint64_t*>(scratch.ptr);
 
     {
+        // spread initial state across the scratch memory to consume kdf memory
+        // this writes evolving state words into the scratch buffer
         std::size_t p = 0;
         for (std::size_t i = 0; i < words; ++i) {
             st[p & 7U] = rotl64(st[p & 7U], 17U) ^ st[(p + 3U) & 7U];
             st[p & 7U] += 0xC2B2AE3D27D4EB4FULL;
-            mem[i] = st[p & 7U];
+            mem[i] = st[p & 7U]; // store evolving state word into scratch
             ++p;
         }
     }
@@ -621,54 +669,73 @@ HardenedKeySchedule deriveHardenedSchedule(const std::string& pass,
 // ---------------------------------------------------------------------------
 //  block cipher
 // ---------------------------------------------------------------------------
+// enhanced round function for the block cipher.
+// - input: a 64-bit half-block and three round keys.
+// - operations: s-box substitution, rotations, nonlinear mixing, key adds.
+// - goal: provide diffusion and confusion inside each round.
 inline std::uint64_t enhancedRoundFunction(std::uint64_t half,
                                            std::uint64_t keyA,
                                            std::uint64_t keyB,
                                            std::uint64_t keyC)
 {
     const auto& sb = sbox();
-    half ^= keyA;
-    half = applySBoxToWord(half, sb);
-    half = rotl64(half, 19U);
-    half += keyB;
-    half ^= rotl64(half, 41U);
-    half *= 0xD6E8FEB86659CDD9ULL;
-    half ^= (half >> 33U);
-    half = applySBoxToWord(half ^ keyC, sb);
-    half = rotl64(half, 13U) ^ rotl64(half, 29U);
-    half += keyA ^ keyC;
-    half ^= (half >> 37U);
+    half ^= keyA; // xor with round key a
+    half = applySBoxToWord(half, sb); // non-linear byte substitution
+    half = rotl64(half, 19U); // rotate for diffusion
+    half += keyB; // add round key b
+    half ^= rotl64(half, 41U); // rotate and xor for mixing
+    half *= 0xD6E8FEB86659CDD9ULL; // nonlinear multiply to spread bits
+    half ^= (half >> 33U); // xor top with shifted bottom for avalanche
+    half = applySBoxToWord(half ^ keyC, sb); // s-box after xor with key c
+    half = rotl64(half, 13U) ^ rotl64(half, 29U); // dual rotations and xor
+    half += keyA ^ keyC; // fold keys back in
+    half ^= (half >> 37U); // final xor/shift mixing
     return half;
 }
 
+// encrypt a single 128-bit block in-place (two 64-bit halves: L, R)
+// - initial whitening uses kWhitenA and kWhitenB to mix key material.
+// - the main loop runs kRounds rounds of the round function; each round
+//   is a feistel-like round that mixes the halves using enhancedRoundFunction.
+// - final whitening is applied after the rounds.
 inline void encryptBlock(std::uint64_t& L, std::uint64_t& R,
                            const HardenedKeySchedule& ks)
 {
+    // initial whitening - xor inputs with first-round keys and whiten constants
     L ^= ks.rka[0] ^ kWhitenA;
     R ^= ks.rkb[0] ^ kWhitenB;
     for (std::size_t r = 0; r < kRounds; ++r) {
+        // feistel round: compute f based on right half and round keys
         std::uint64_t f = enhancedRoundFunction(R, ks.rka[r], ks.rkb[r], ks.rkc[r]);
-        std::uint64_t nL = R;
-        R = L ^ f;
-        L = nL;
+        std::uint64_t nL = R; // save current right as new left
+        R = L ^ f; // new right is left xor f(right)
+        L = nL; // rotate halves
     }
+    // final whitening - mix in last round keys and swap whiten constants
     L ^= ks.rka[kRounds - 1] ^ kWhitenB;
     R ^= ks.rkb[kRounds - 1] ^ kWhitenA;
 }
 
 // ---------------------------------------------------------------------------
-//  CTR mode cipher (symmetric -- encrypt = decrypt)
+//  ctr mode cipher (symmetric - encrypt = decrypt)
 // ---------------------------------------------------------------------------
+// initialize a 128-bit counter from the given salt
+// - uses a deterministic mixing of salt bytes into two 64-bit words
+// - result is used as the initial ctr value for ctr mode keystream generation
 inline std::array<std::uint8_t, kBlockSize> initCtrFromSalt(const ByteVector& salt) {
     std::array<std::uint8_t, kBlockSize> ctr{};
+    // starting mix seeds for ctr initialization
     std::uint64_t sL = 0x6A09E667F3BCC909ULL;
     std::uint64_t sR = 0xBB67AE8584CAA73BULL;
     for (std::size_t i = 0; i < salt.size(); ++i) {
+        // mix salt byte into sL using byte shifts and a small rotation
         sL ^= static_cast<std::uint64_t>(salt[i]) << ((i % 8U) * 8U);
         sL = rotl64(sL, 9U);
+        // mix salt byte into sR using an offset to decorrelate lanes
         sR ^= static_cast<std::uint64_t>(salt[i]) << (((i + 3U) % 8U) * 8U);
         sR = rotl64(sR, 13U);
     }
+    // write the two 64-bit words into the 128-bit counter (little-endian)
     store64LE(ctr.data(), sL);
     store64LE(ctr.data() + 8, sR);
     return ctr;
@@ -678,6 +745,11 @@ void applyCipher(const ByteVector& in, ByteVector& out,
                  const HardenedKeySchedule& ks,
                  const ByteVector& salt)
 {
+    // apply stream cipher generated from block cipher in ctr mode.
+    // - ctr is initialized deterministically from the salt so encryption is
+    //   repeatable for the same salt and key schedule.
+    // - encrypt and decrypt are the same operation in ctr mode: xor with keystream.
+    // - keystream blocks are produced by encryptBlock applied to the counter.
     out.resize(in.size());
     auto ctr = initCtrFromSalt(salt);
     std::array<std::uint8_t, kBlockSize> ksBuf{};
@@ -685,10 +757,10 @@ void applyCipher(const ByteVector& in, ByteVector& out,
     while (off < in.size()) {
         std::uint64_t l = load64LE(ctr.data());
         std::uint64_t r = load64LE(ctr.data() + 8);
-        encryptBlock(l, r, ks);
-        store64LE(ksBuf.data(), l);
-        store64LE(ksBuf.data() + 8, r);
-        std::size_t chunk = std::min<std::size_t>(kBlockSize, in.size() - off);
+        encryptBlock(l, r, ks); // produce one keystream block by encrypting ctr
+        store64LE(ksBuf.data(), l); // store keystream low 64 bits
+        store64LE(ksBuf.data() + 8, r); // store keystream high 64 bits
+        std::size_t chunk = std::min<std::size_t>(kBlockSize, in.size() - off); // bytes to process this iteration
         const std::size_t fullWords = chunk / 8;
         for (std::size_t j = 0; j < fullWords; ++j) {
             std::uint64_t win = 0, ksw = 0;
@@ -705,10 +777,11 @@ void applyCipher(const ByteVector& in, ByteVector& out,
 }
 
 // ---------------------------------------------------------------------------
-//  256-bit cascaded MAC
+//  256-bit cascaded mac
 // ---------------------------------------------------------------------------
 struct Mac256 { std::uint64_t h[4]; };
 
+// constant-time comparison for mac values to reduce timing leakage
 inline bool constantTimeMacEq(const Mac256& a, const Mac256& b) {
     volatile std::uint64_t diff = 0;
     diff |= a.h[0] ^ b.h[0];
@@ -724,23 +797,29 @@ namespace {
         0x10000000233ULL, 0x10000000259ULL
     };
 
+    // feed a single byte into the mac state
+    // the state is 4 x 64-bit lanes, each mixed with different primes
     inline void macFeedByte(Mac256& mac, std::uint8_t byte) {
         for (int i = 0; i < 4; ++i) {
-            mac.h[i] ^= byte;
-            mac.h[i] *= kMacPrimes[i];
-            mac.h[i] ^= (mac.h[i] >> 33U);
+            mac.h[i] ^= byte; // xor incoming byte into lane i
+            mac.h[i] *= kMacPrimes[i]; // multiply by lane prime to scramble
+            mac.h[i] ^= (mac.h[i] >> 33U); // xor with shifted bits for diffusion
         }
+        // cross-mix lanes to increase avalanche between the 4 words
         mac.h[0] ^= rotl64(mac.h[3], 7U);
         mac.h[1] ^= rotl64(mac.h[0], 11U);
         mac.h[2] ^= rotl64(mac.h[1], 17U);
         mac.h[3] ^= rotl64(mac.h[2], 23U);
     }
 
+    // feed a contiguous buffer into the mac
     inline void macFeedBuffer(Mac256& mac, const std::uint8_t* buf, std::size_t len) {
         for (std::size_t i = 0; i < len; ++i)
             macFeedByte(mac, buf[i]);
     }
 
+    // initialize mac state from password, two salts and plaintext length
+    // this establishes the starting state before feeding the plaintext bytes
     inline Mac256 macInit(const std::string& pass,
                           const ByteVector& salt1,
                           const ByteVector& salt2,
@@ -754,7 +833,7 @@ namespace {
 
         macFeedByte(mac, static_cast<std::uint8_t>(pass.size() & 0xFFU));
         macFeedByte(mac, static_cast<std::uint8_t>((pass.size() >> 8U) & 0xFFU));
-        for (unsigned char ch : pass) macFeedByte(mac, static_cast<std::uint8_t>(ch));
+        for (unsigned char ch : pass) macFeedByte(mac, static_cast<std::uint8_t>(ch)); // include password bytes in mac
         for (std::uint8_t b : salt1) macFeedByte(mac, b);
         macFeedByte(mac, 0xFFU);
         for (std::uint8_t b : salt2) macFeedByte(mac, b);
@@ -769,9 +848,9 @@ namespace {
     inline void macFinalize(Mac256& mac) {
         for (int round = 0; round < 8; ++round)
             for (int i = 0; i < 4; ++i) {
-                mac.h[i] ^= rotl64(mac.h[(i + 1) & 3], 19U);
-                mac.h[i] *= kMacPrimes[i];
-                mac.h[i] ^= (mac.h[i] >> 29U);
+                mac.h[i] ^= rotl64(mac.h[(i + 1) & 3], 19U); // mix in neighbor lanes
+                mac.h[i] *= kMacPrimes[i]; // multiply by lane-specific prime
+                mac.h[i] ^= (mac.h[i] >> 29U); // xor with shifted value for further mixing
             }
     }
 } // anon
@@ -815,10 +894,16 @@ inline std::string currentDateString() {
     return std::string(buf, kDateLen);
 }
 
-// build augmented payload: chaff + metadata + plaintext (V6)
+// build augmented payload: chaff + metadata + plaintext (v6)
+// layout (in order):
+// - 2-byte little-endian chaff length, then chaff bytes
+// - 2-byte little-endian name length, then name bytes
+// - fixed-length date field (kDateLen bytes)
+// - plaintext bytes
+// chaff length is chosen from gSettings.chaffMin..chaffMax using secure randomness
 ByteVector buildAugmentedV6(const ByteVector& plain, const FileMetadata& meta) {
     std::uint8_t rndByte[1];
-    fillCryptoRandom(rndByte, 1);
+    fillCryptoRandom(rndByte, 1); // one random byte used to pick chaff length
     std::size_t chMin = gSettings.chaffMin;
     std::size_t chMax = gSettings.chaffMax;
     if (chMin > chMax) std::swap(chMin, chMax);
@@ -837,10 +922,10 @@ ByteVector buildAugmentedV6(const ByteVector& plain, const FileMetadata& meta) {
     aug.reserve(2 + chaffLen + 2 + name.size() + kDateLen + plain.size());
 
     // chaff header (2-byte LE length) + random chaff
-    aug.push_back(static_cast<std::uint8_t>(chaffLen & 0xFFU));
-    aug.push_back(static_cast<std::uint8_t>((chaffLen >> 8U) & 0xFFU));
+    aug.push_back(static_cast<std::uint8_t>(chaffLen & 0xFFU)); // chaff len low byte
+    aug.push_back(static_cast<std::uint8_t>((chaffLen >> 8U) & 0xFFU)); // chaff len high byte
     aug.resize(2 + chaffLen);
-    fillCryptoRandom(aug.data() + 2, chaffLen);
+    fillCryptoRandom(aug.data() + 2, chaffLen); // fill chaff bytes with secure random data
 
     // metadata: name length (2-byte LE) + name + date
     std::size_t nl = name.size();
@@ -854,12 +939,13 @@ ByteVector buildAugmentedV6(const ByteVector& plain, const FileMetadata& meta) {
     return aug;
 }
 
-// parse V6 augmented payload: extract metadata + plaintext
+// parse v6 augmented payload: extract metadata and plaintext
+// performs bounds checks on chaff and metadata to detect corruption or wrong passphrase
 ByteVector parseAugmentedV6(const ByteVector& aug, FileMetadata& meta) {
     if (aug.size() < 2)
         throw std::runtime_error("authentication failed: wrong passphrase or corrupted data");
 
-    // read chaff
+    // read chaff (16-bit little-endian length)
     std::size_t chaffLen = static_cast<std::size_t>(aug[0]) |
                            (static_cast<std::size_t>(aug[1]) << 8U);
     if (chaffLen > 1024 || 2 + chaffLen > aug.size())
@@ -896,23 +982,30 @@ struct DecryptResult {
     std::uint8_t version = 0;
 };
 
-// always encrypts as V6 (with embedded filename + date)
+// always encrypts as v6 (with embedded filename and date)
+// process:
+// - generate two independent salts
+// - build augmented payload (chaff + metadata + plaintext)
+// - derive ks1 from passphrase and salt1 and encrypt the augmented payload
+// - derive ks2 from passphrase and salt2 and encrypt pass1 to produce ciphertext
+// - compute mac over the original plaintext and both salts
+// - assemble output: magic(4) + version(1) + saltLen(1) + macLen(1) + salt1 + salt2 + mac + ciphertext
 ByteVector encryptPayload(const ByteVector& plain,
                           const std::string& passphrase,
                           const FileMetadata& meta)
 {
-    ByteVector salt1 = generateSalt(kSaltSize);
-    ByteVector salt2 = generateSalt(kSaltSize);
+    ByteVector salt1 = generateSalt(kSaltSize); // salt for first encryption pass
+    ByteVector salt2 = generateSalt(kSaltSize); // salt for second encryption pass
 
     ByteVector augmented = buildAugmentedV6(plain, meta);
 
-    // first encryption pass
+    // first encryption pass: augmented -> pass1
     auto ks1 = deriveHardenedSchedule(passphrase, salt1);
     ScopedKS w1(ks1);
     ByteVector pass1;
     applyCipher(augmented, pass1, ks1, salt1);
 
-    // second encryption pass
+    // second encryption pass: pass1 -> pass2
     auto ks2 = deriveHardenedSchedule(passphrase, salt2);
     ScopedKS w2(ks2);
     ByteVector pass2;
@@ -921,7 +1014,7 @@ ByteVector encryptPayload(const ByteVector& plain,
     // MAC over original plaintext
     Mac256 mac = computeHardenedMac(plain, passphrase, salt1, salt2);
 
-    // assemble output
+    // assemble output bytes in order: magic, version, saltLen, macLen, salt1, salt2, mac, ciphertext
     ByteVector output;
     output.reserve(4 + 3 + kSaltSize * 2 + kMacSize + pass2.size());
     output.insert(output.end(), kMagicV6.begin(), kMagicV6.end());
@@ -941,7 +1034,14 @@ ByteVector encryptPayload(const ByteVector& plain,
     return output;
 }
 
-// auto-detect payload format; returns plaintext + metadata (V6 only)
+// auto-detect payload format; returns plaintext and metadata (v6 only)
+// decrypt flow:
+// - validate header and version
+// - extract salt lengths, mac length, salts and stored mac
+// - reverse double encryption using ks2 then ks1
+// - parse augmented payload to recover metadata and plaintext
+// - verify mac over recovered plaintext and salts using constant-time compare
+// - throw on any validation or authentication failure
 DecryptResult decryptPayload(const ByteVector& input,
                              const std::string& passphrase)
 {
@@ -949,7 +1049,7 @@ DecryptResult decryptPayload(const ByteVector& input,
     if (input.size() < baseHdr)
         throw std::invalid_argument("encrypted data is too short");
 
-    // detect version (only V6 supported)
+    // detect version (only v6 supported)
     bool isV6 = std::equal(kMagicV6.begin(), kMagicV6.end(), input.begin());
     if (!isV6) {
         if (input.size() >= 4 &&
@@ -963,7 +1063,7 @@ DecryptResult decryptPayload(const ByteVector& input,
         throw std::runtime_error("encrypted data header mismatch");
     }
 
-    std::uint8_t version = input[4];
+    std::uint8_t version = input[4]; // version byte from header
     if (version != kVersionV6) {
         if (version > kVersionV6) {
             throw std::runtime_error(
@@ -973,8 +1073,8 @@ DecryptResult decryptPayload(const ByteVector& input,
         throw std::runtime_error("unsupported encrypted data version");
     }
 
-    std::uint8_t saltLen = input[5];
-    std::uint8_t macLen  = input[6];
+    std::uint8_t saltLen = input[5]; // length of each salt in bytes
+    std::uint8_t macLen  = input[6]; // length of mac in bytes
     if (saltLen == 0 || macLen == 0 || macLen != kMacSize)
         throw std::runtime_error("corrupted encrypted data header");
 
@@ -1027,8 +1127,12 @@ DecryptResult decryptPayload(const ByteVector& input,
 }
 
 // ---------------------------------------------------------------------------
-//  file I/O
+//  file i/o
 // ---------------------------------------------------------------------------
+// read and write utilities for binary files
+// - readBinaryFile: read entire file into a ByteVector, works with unknown sizes
+// - writeBinaryFile: write a ByteVector to disk, truncating the target file
+// both functions throw std::runtime_error on failure
 ByteVector readBinaryFile(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("unable to open file: " + path);
@@ -1041,6 +1145,7 @@ ByteVector readBinaryFile(const std::string& path) {
                           std::istreambuf_iterator<char>()};
     }
     f.seekg(0, std::ios::beg);
+    // preallocate a buffer of the file size and read into it
     ByteVector data(static_cast<std::size_t>(sz));
     if (!data.empty()) {
         f.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()));
@@ -1053,6 +1158,7 @@ ByteVector readBinaryFile(const std::string& path) {
 void writeBinaryFile(const std::string& path, const ByteVector& data) {
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     if (!f) throw std::runtime_error("unable to open output file: " + path);
+    // write all bytes from the vector to the file (truncating existing file)
     f.write(reinterpret_cast<const char*>(data.data()),
             static_cast<std::streamsize>(data.size()));
     if (!f) throw std::runtime_error("failed to write file: " + path);
@@ -1204,10 +1310,12 @@ std::wstring utf8ToWide(const std::string& text) {
 bool parseAppVersionText(const std::string& text, AppVersion& version) {
     std::string cleaned = trimCopy(text);
     if (cleaned.empty()) return false;
+    // accept leading 'v' or 'V' (strip if present)
     if (cleaned[0] == 'v' || cleaned[0] == 'V')
         cleaned.erase(cleaned.begin());
 
     // parse format: MAJOR.MINOR.PATCH[pre-release]
+    // parse major.minor.patch numeric fields
     const char* s = cleaned.c_str();
     char* tail = nullptr;
     long maj = std::strtol(s, &tail, 10);
@@ -1219,10 +1327,11 @@ bool parseAppVersionText(const std::string& text, AppVersion& version) {
     long pat = std::strtol(s, &tail, 10);
     if (tail == s) return false;
 
+    // optional pre-release label follows the numeric parts
     std::string pre;
     if (*tail != '\0') {
         pre = std::string(tail);
-        // strip leading '-' if present (accept both "0.2.0-pre1" and "0.2.0pre1")
+        // strip leading '-' or '+' if present to normalize label
         if (!pre.empty() && (pre[0] == '-' || pre[0] == '+')) pre.erase(pre.begin());
         pre = trimCopy(pre);
     }
@@ -1321,10 +1430,12 @@ bool parseHttpsUrlParts(const std::string& url,
                         std::wstring& path)
 {
     const std::string prefix = "https://";
+    // must start with "https://" otherwise reject
     if (url.rfind(prefix, 0) != 0)
         return false;
 
     std::string remainder = url.substr(prefix.size());
+    // split into host[:port] and path parts
     std::size_t slashPos = remainder.find('/');
     std::string hostPort = slashPos == std::string::npos
         ? remainder
@@ -1337,6 +1448,7 @@ bool parseHttpsUrlParts(const std::string& url,
 
     port = kInternetDefaultHttpsPort;
     std::size_t colonPos = hostPort.rfind(':');
+    // optional :port suffix handling
     if (colonPos != std::string::npos) {
         std::string portText = hostPort.substr(colonPos + 1);
         hostPort = hostPort.substr(0, colonPos);
@@ -1367,18 +1479,21 @@ bool fetchHttpsTextWinHttp(const std::string& url,
     std::wstring host;
     std::wstring path;
     INTERNET_PORT port = kInternetDefaultHttpsPort;
+    // parse url into host, port and path parts
     if (!parseHttpsUrlParts(url, host, port, path)) {
         error = "invalid version URL";
         return false;
     }
 
     static WinHttpApi api;
+    // load winhttp functions dynamically to avoid static dependency
     if (!api.load()) {
         error = "winhttp.dll is unavailable";
         return false;
     }
 
     std::wstring ua = utf8ToWide(std::string("TherapistVersionCheck/") + kAppVersionText);
+    // open a winhttp session handle
     HINTERNET session = api.open(ua.c_str(),
                                  kWinHttpAccessTypeDefaultProxy,
                                  nullptr,
@@ -1393,6 +1508,7 @@ bool fetchHttpsTextWinHttp(const std::string& url,
     HINTERNET connect = nullptr;
     HINTERNET request = nullptr;
     do {
+        // set conservative timeouts for resolve/connect/send/receive
         if (!api.setTimeouts(session,
                              kVersionResolveTimeoutMs,
                              kVersionConnectTimeoutMs,
@@ -1402,12 +1518,14 @@ bool fetchHttpsTextWinHttp(const std::string& url,
             break;
         }
 
+        // establish connection to host:port
         connect = api.connect(session, host.c_str(), port, 0);
         if (!connect) {
             error = "unable to connect to version host";
             break;
         }
 
+        // open a simple GET request over https
         request = api.openRequest(connect,
                                   L"GET",
                                   path.c_str(),
@@ -1421,6 +1539,7 @@ bool fetchHttpsTextWinHttp(const std::string& url,
         }
 
         const wchar_t* headers = L"Cache-Control: no-cache\r\nPragma: no-cache\r\n";
+        // send the request and await response
         if (!api.sendRequest(request,
                              headers,
                              static_cast<DWORD>(-1L),
@@ -1436,6 +1555,7 @@ bool fetchHttpsTextWinHttp(const std::string& url,
             break;
         }
 
+        // read and validate http status code
         DWORD statusCode = 0;
         DWORD statusSize = sizeof(statusCode);
         if (!api.queryHeaders(request,
@@ -1452,6 +1572,7 @@ bool fetchHttpsTextWinHttp(const std::string& url,
             break;
         }
 
+        // read response body in chunks until none left
         body.clear();
         while (true) {
             DWORD available = 0;
@@ -1470,7 +1591,7 @@ bool fetchHttpsTextWinHttp(const std::string& url,
                 error = "unable to read version response body";
                 break;
             }
-            body.append(buffer.data(), bytesRead);
+            body.append(buffer.data(), bytesRead); // append chunk to body
         }
     } while (false);
 
@@ -1485,17 +1606,20 @@ bool fetchHttpsTextWinHttp(const std::string& url,
 // (binary download + SHA256 verification removed)
 
 void runRemoteVersionCheck() {
+    // reset info and mark that we've attempted a check
     gRemoteVersionInfo = RemoteVersionInfo{};
     gRemoteVersionInfo.checked = true;
-    gRemoteVersionInfo.versionInfoUrl = getVersionInfoUrl();
+    gRemoteVersionInfo.versionInfoUrl = getVersionInfoUrl(); // where to fetch version info
 
+    // fetch remote text manifest from the configured url
     std::string body;
     if (!fetchHttpsTextWinHttp(gRemoteVersionInfo.versionInfoUrl,
                                body,
                                gRemoteVersionInfo.errorMessage)) {
-        return;
+        return; // leave error message populated by fetch function
     }
 
+    // parse manifest into version + optional download url
     AppVersion latestVersion{};
     std::string downloadUrl;
     if (!parseVersionFileText(body, latestVersion, downloadUrl)) {
@@ -1503,6 +1627,7 @@ void runRemoteVersionCheck() {
         return;
     }
 
+    // populate results and determine whether current build is outdated
     gRemoteVersionInfo.succeeded = true;
     gRemoteVersionInfo.latestVersion = latestVersion;
     gRemoteVersionInfo.downloadUrl = downloadUrl;
@@ -1536,10 +1661,14 @@ std::uint64_t currentTimeSeconds() {
 
 ByteVector buildMessagePayload(const std::string& msg, std::uint64_t ts) {
     ByteVector p;
+    // reserve expected size to avoid reallocations
     p.reserve(sizeof(kMessageMagic) + sizeof(ts) + msg.size());
+    // prefix with magic marker to identify message payloads
     p.insert(p.end(), std::begin(kMessageMagic), std::end(kMessageMagic));
+    // append 64-bit timestamp in big-endian order
     for (int s = 56; s >= 0; s -= 8)
         p.push_back(static_cast<std::uint8_t>((ts >> s) & 0xFFU));
+    // append message bytes
     p.insert(p.end(), msg.begin(), msg.end());
     return p;
 }
@@ -1547,6 +1676,7 @@ ByteVector buildMessagePayload(const std::string& msg, std::uint64_t ts) {
 bool parseMessagePayload(const ByteVector& data, std::string& msg, std::uint64_t& ts) {
     const std::size_t hs = sizeof(kMessageMagic) + sizeof(std::uint64_t);
     if (data.size() < hs) return false;
+    // validate magic marker at start
     if (!std::equal(std::begin(kMessageMagic), std::end(kMessageMagic), data.begin()))
         return false;
     ts = 0;
@@ -1561,12 +1691,15 @@ std::string formatTimestamp(std::uint64_t ts) {
     std::tm ti{};
 #ifdef _WIN32
 #if defined(_MSC_VER)
+    // thread-safe localtime variant on msvc
     if (localtime_s(&ti, &raw) != 0) return "unknown";
 #else
+    // fallback to std::localtime result copy for other windows compilers
     if (std::tm* tmp = std::localtime(&raw)) ti = *tmp;
     else return "unknown";
 #endif
 #else
+    // unix-like thread-safe localtime variant
     if (localtime_r(&raw, &ti) == nullptr) return "unknown";
 #endif
     std::ostringstream oss;
@@ -1577,6 +1710,7 @@ std::string formatTimestamp(std::uint64_t ts) {
 std::vector<std::string> listMessageFiles(const std::string& dir) {
     std::vector<std::string> files;
 #ifdef _WIN32
+    // scan for files matching "file_*" using win32 find APIs
     std::string pat = joinPath(dir, "file_*");
     WIN32_FIND_DATAA fd{};
     HANDLE h = FindFirstFileA(pat.c_str(), &fd);
@@ -1588,6 +1722,7 @@ std::vector<std::string> listMessageFiles(const std::string& dir) {
         FindClose(h);
     }
 #else
+    // unix-like: iterate directory entries and collect those starting with "file_"
     std::string dp = dir.empty() ? "." : dir;
     if (DIR* d = opendir(dp.c_str())) {
         while (dirent* e = readdir(d)) {
@@ -1606,6 +1741,7 @@ std::string generateMessageFilePath(const std::string& baseDir) {
         std::chrono::system_clock::now().time_since_epoch()).count();
     std::string cand;
     std::size_t attempt = 0;
+    // create a candidate filename using current epoch ms and ensure uniqueness
     do {
         std::ostringstream oss;
         oss << "file_" << ms;
@@ -1639,6 +1775,7 @@ bool enableAnsiColors() {
         if (GetConsoleMode(eh, &em))
             SetConsoleMode(eh, em | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
     }
+    // attempt to enable ansi vt processing and utf-8 output on windows
     gUnicodeSupported = (SetConsoleOutputCP(CP_UTF8) != 0);
     if (gUnicodeSupported) {
         SetConsoleCP(CP_UTF8);
@@ -1647,6 +1784,7 @@ bool enableAnsiColors() {
     initSymbols();
     return true;
 #else
+    // unix-like: set locale and detect utf support from env vars
     std::setlocale(LC_ALL, "en_US.UTF-8");
     const char* lang = std::getenv("LANG");
     const char* lcAll = std::getenv("LC_ALL");
@@ -1716,6 +1854,7 @@ void animateTitle() {
     const int resolveFrames = 3;
     const int frameDelay = 50;
 
+    // simple lcg rng used only for title animation randomness
     unsigned seed = static_cast<unsigned>(
         std::chrono::steady_clock::now().time_since_epoch().count() & 0xFFFFFFFFU);
     auto rng = [&seed]() -> unsigned {
@@ -1729,9 +1868,11 @@ void animateTitle() {
             display[i] = glyphs[rng() % glyphCount];
     }
 
+    // reveal title one position at a time with a small resolve animation
     for (std::size_t pos = 0; pos < title.size(); ++pos) {
         if (title[pos] == ' ') continue;
         for (int frame = 0; frame < resolveFrames; ++frame) {
+            // fill trailing characters with randomized glyphs for visual effect
             for (std::size_t j = pos; j < title.size(); ++j) {
                 if (title[j] != ' ')
                     display[j] = glyphs[rng() % glyphCount];
@@ -1743,6 +1884,7 @@ void animateTitle() {
             std::this_thread::sleep_for(std::chrono::milliseconds(frameDelay));
 #endif
         }
+        // lock in the real character at this position
         display[pos] = title[pos];
     }
     std::cout << "\r" << Color::accent << pad << title << Color::reset << std::endl;
@@ -1851,6 +1993,7 @@ void spinnerThread(const std::string& msg, std::atomic<bool>& done,
     const char frames[] = {'|', '/', '-', '\\'};
     int i = 0;
     while (!done.load(std::memory_order_relaxed)) {
+        // simple spinner loop prints a rotating frame until work completes
         std::cout << "\r  " << Color::muted << msg << " "
                   << frames[i % 4] << " " << Color::reset << std::flush;
         ++i;
@@ -1871,6 +2014,7 @@ auto withSpinner(const std::string& msg, Func&& fn) -> decltype(fn()) {
     std::atomic<bool> succeeded{false};
     std::thread t(spinnerThread, msg, std::ref(done), std::ref(succeeded));
     try {
+        // run the provided work while spinner animates in another thread
         auto result = fn();
         succeeded.store(true, std::memory_order_relaxed);
         done.store(true, std::memory_order_relaxed);
@@ -2815,10 +2959,12 @@ bool checkPasswordAcceptable(std::string& passphrase) {
         else if (strength.score >= 40) color = Color::warn;
         else if (strength.score >= 20) color = Color::warnBold;
 
+        // show evaluated password strength to the user
         std::cout << "    " << color << "password strength: " << strength.rating
-                  << " (" << strength.score << "/100)" << Color::reset << std::endl;
+              << " (" << strength.score << "/100)" << Color::reset << std::endl;
 
         if (gSettings.confirmWeakPasswords && strength.score < 40) {
+            // print any heuristic warnings found during evaluation
             for (const auto& w : strength.warnings)
                 printWarn(w);
 
