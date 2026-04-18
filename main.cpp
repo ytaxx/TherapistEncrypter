@@ -105,7 +105,7 @@ constexpr const char* kAppVersionText = "0.2.0pre4"; // update this one place fo
 constexpr const char* kCurrentVersionText = kAppVersionText;
 static AppVersion kCurrentAppVersion{0, 0, 0, ""};
 constexpr const char* kDefaultVersionInfoUrl =
-    "https://raw.githubusercontent.com/ytaxx/TherapistEncrypter/refs/heads/v0.2.0pre3/version.txt";
+    "https://raw.githubusercontent.com/ytaxx/TherapistEncrypter/refs/heads/v0.2.0pre4/version.txt";
 constexpr const char* kDefaultReleaseUrl =
     "https://github.com/ytaxx/TherapistEncrypter/releases";
 constexpr int kVersionResolveTimeoutMs = 2000;
