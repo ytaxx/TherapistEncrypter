@@ -62,6 +62,9 @@ using WinHttpCloseHandleFn = BOOL (WINAPI*)(HINTERNET);
 #include <utime.h>
 #endif
 
+
+// the newly added comments made by AI, I was lazy to explain things more
+
 namespace therapist {
 // ---------------------------------------------------------------------------
 //  types
