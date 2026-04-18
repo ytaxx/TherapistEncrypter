@@ -2684,22 +2684,34 @@ bool parseSizeWithSuffix(const std::string& s, std::size_t& out) {
 
 
 void showOutdatedVersionWarning(bool ansi) {
+    // proceed if we've attempted a remote check and either:
+    // - succeeded and the remote indicates we're outdated, or
+    // - the remote check failed (we will still show a warning without latest-version info)
 #ifdef _WIN32
-    // only proceed if we successfully queried a remote version
-    if (!gRemoteVersionInfo.checked || !gRemoteVersionInfo.succeeded) return;
-    // if not outdated, do not block the user - the main menu will print a green status
-    if (!gRemoteVersionInfo.outdated) return;
+    if (!gRemoteVersionInfo.checked) return;
+    if (gRemoteVersionInfo.succeeded) {
+        if (!gRemoteVersionInfo.outdated) return;
+    }
 #else
     if (!isProgramOutdated()) return;
 #endif
 #ifdef _WIN32
-    std::string latest = formatAppVersion(gRemoteVersionInfo.latestVersion);
     std::string current = formatAppVersion(kCurrentAppVersion);
-    std::string popupText = std::string("This program is outdated.\n\n") +
-        "You're using " + current + "\n" +
-        "Latest available: " + latest + "\n\n" +
-        "You can download the latest version\n" +
-        "\nThis message will also appear in the console with the download link.";
+    std::string popupText;
+    if (gRemoteVersionInfo.succeeded) {
+        std::string latest = formatAppVersion(gRemoteVersionInfo.latestVersion);
+        popupText = std::string("This program is outdated.\n\n") +
+            "You're using " + current + "\n" +
+            "Latest available: " + latest + "\n\n" +
+            "You can download the latest version\n" +
+            "\nThis message will also appear in the console with the download link.";
+    } else {
+        // couldn't fetch latest info; warn the user but don't show a latest-version line
+        popupText = std::string("This program may be outdated.\n\n") +
+            "You're using " + current + "\n\n" +
+            "Unable to check for updates (network error). Please verify manually.\n\n" +
+            "This message will also appear in the console.";
+    }
     // try to disable console input / echo while the popup is visible so
     // keystrokes typed by the user while the dialog is open are not buffered
     HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
@@ -2729,9 +2741,16 @@ void showOutdatedVersionWarning(bool ansi) {
     printSection("update warning");
     // keep console output minimal: advise user to download latest and provide
     // the URL here (the popup intentionally omits the direct link)
-    printWarn("this program is outdated, you're using " + current + ", you can download the latest version");
-    if (!gRemoteVersionInfo.downloadUrl.empty())
-        printNote("from here: " + gRemoteVersionInfo.downloadUrl);
+    if (gRemoteVersionInfo.succeeded) {
+        printWarn("this program is outdated, you're using " + current + ", you can download the latest version");
+        if (!gRemoteVersionInfo.downloadUrl.empty())
+            printNote("from here: " + gRemoteVersionInfo.downloadUrl);
+    } else {
+        // failed to fetch latest info: show conservative warning without latest-version line
+        printWarn("this program may be outdated; unable to check for latest version. you're using " + current);
+        if (!gRemoteVersionInfo.downloadUrl.empty())
+            printNote("you can manually check releases here: " + gRemoteVersionInfo.downloadUrl);
+    }
     std::cout << std::endl;
     printDivider();
     std::cout << std::endl;
@@ -3200,11 +3219,16 @@ int main(int argc, char* argv[]) {
             std::cout << std::endl;
             printDivider();
             std::cout << std::endl;
-            if (gRemoteVersionInfo.checked && gRemoteVersionInfo.succeeded) {
-                if (gRemoteVersionInfo.outdated) {
-                    printWarn("program is outdated, you're using " + formatAppVersion(kCurrentAppVersion) + " please download the latest version");
+            if (gRemoteVersionInfo.checked) {
+                if (gRemoteVersionInfo.succeeded) {
+                    if (gRemoteVersionInfo.outdated) {
+                        printWarn("may be the program is outdated, you're using " + formatAppVersion(kCurrentAppVersion) + " please download the latest version");
+                    } else {
+                        printOk("program is up to date, you're using " + formatAppVersion(kCurrentAppVersion));
+                    }
                 } else {
-                    printOk("program is up to date, you're using " + formatAppVersion(kCurrentAppVersion));
+                    // remote check failed: show a conservative warning without latest-version line
+                    printWarn("program may be outdated, unable to check latest version; you're using " + formatAppVersion(kCurrentAppVersion));
                 }
                 std::cout << std::endl;
             }
