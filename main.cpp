@@ -99,13 +99,13 @@ struct RemoteVersionInfo {
 
 // application identity / version (single edit point)
 constexpr const char* kAppExeName = "therapist";
-constexpr const char* kAppVersionText = "0.2.0pre3"; // update this one place for compiled default
+constexpr const char* kAppVersionText = "0.2.0pre4"; // update this one place for compiled default
 // default current version text. you can override at runtime with
 // the THERAPIST_CURRENT_VERSION environment variable
 constexpr const char* kCurrentVersionText = kAppVersionText;
 static AppVersion kCurrentAppVersion{0, 0, 0, ""};
 constexpr const char* kDefaultVersionInfoUrl =
-    "https://raw.githubusercontent.com/ytaxx/TherapistEncrypter/refs/heads/v0.2.x/version.txt";
+    "https://raw.githubusercontent.com/ytaxx/TherapistEncrypter/refs/heads/v0.2.0pre3/version.txt";
 constexpr const char* kDefaultReleaseUrl =
     "https://github.com/ytaxx/TherapistEncrypter/releases";
 constexpr int kVersionResolveTimeoutMs = 2000;
