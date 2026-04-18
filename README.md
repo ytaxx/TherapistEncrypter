@@ -1,104 +1,123 @@
-![image](https://github.com/ytaxx/TherapistEncrypter/blob/main/therapist.png)
+# TherapistEncrypter (still in dev)
 
-# TherapistEncrypter
+A single-file, self-contained C++17 command-line encryption tool. No external dependencies required - just compile and run or download the latest compiled program.
 
-A single-file, self-contained C++17 command-line encryptor. This repository implements a compact, audit-friendly double-pass cipher with a memory-hard key derivation and streaming file I/O. It is intended for local file encryption and a small interactive message mode.
+See the full implementation in [main.cpp](main.cpp).
 
-See the implementation in [main.cpp](main.cpp).
+![image](https://github.com/ytaxx/TherapistEncrypter/blob/v0.2.0/img/1.png)
 
-## Current status
+## Features
 
-- Single-file C++17 implementation: `main.cpp` contains the full program (no external libraries required).
-- Streaming chunked I/O: file-mode encryption/decryption streams data in 64 KiB chunks to avoid full-file buffering (`encryptFileStreamToFile` / `decryptFileStreamToFile`).
-- Hardened KDF (V5): memory-hard key stretching using a 1 MiB scratch area and 131,072 iterations (`deriveHardenedSchedule`).
-- Double-pass V5 encryption with independent salts (salt1/salt2) and legacy V4 decryption support.
-- Incremental 256-bit MAC (4 × u64) with constant-time comparison; MAC is computed over the original plaintext and written into the header after streaming the ciphertext.
-- Optimizations: 64-bit word operations, memcpy-based LE load/store, precomputed 64-bit S-box lane tables (`SBoxPair::fwd64`), 64-bit XOR hot-paths in CTR loops.
+- **Single-file C++17** - the entire program lives in `main.cpp`, no libraries to install
+- **V6 encrypted format** - embeds original filename and date inside the ciphertext
+- **Double-pass Feistel cipher** - 32-round SBox-based block cipher in CTR mode, applied twice with independent salts
+- **Memory-hard KDF** - 131,072 iterations over a 1 MiB scratch buffer (tunable via CLI or environment)
+- **256-bit cascaded MAC** - 4×64-bit FNV-like chains with constant-time verification
+- **Interactive menu** - encrypt files, decrypt files, write/read encrypted messages
+- **Built-in self-test** - 16 tests covering crypto primitives, payloads, authentication, file I/O, and message helpers
+- **Backward compatible** - reads V5 encrypted files (no metadata) (V4 removed)
+- **Secure memory** - RAII key wiping, locked memory support, secure zero on all sensitive buffers
 
 ## Build
 
-Recommended (highest-performance, GCC/Clang):
-
 ```bash
-g++ -std=c++17 -O3 -march=native -flto -DNDEBUG -o therapist main.cpp
+g++ -std=c++17 -O2 -pipe -static -static-libgcc -static-libstdc++ -o therapist.exe main.cpp
 ```
 
-Portable / quick build:
+On Windows with MinGW, the same command works. No `-pthread` needed - Windows threading uses the native API.
+
+Run the self-test:
 
 ```bash
-g++ -std=c++17 -O2 -pipe -o therapist main.cpp
+./therapist --self-test
 ```
-
-Notes:
-- On Windows with MinGW/MSYS these commands work similarly. For MSVC create a Visual Studio project or compile with `cl` and equivalent optimization flags.
-- If you enable future threaded features (parallel CTR segmentation, thread pools), you may need to add `-pthread` on POSIX systems.
-- For profile-guided optimizations (PGO), build with `-fprofile-generate` and then `-fprofile-use` as usual for your toolchain.
 
 ## Usage
 
-Non-interactive encrypt (simple):
+### Non-interactive
+
+Encrypt a file:
 
 ```bash
-./therapist input.bin "my passphrase"
-# -> writes: input.bin.encrypt
+./therapist input.pdf "my passphrase"
+# -> input.pdf.encrypted
 ```
 
-Non-interactive decrypt:
+Decrypt a file:
 
 ```bash
-./therapist decrypt input.bin.encrypt "my passphrase"
-# -> writes: input.bin (or input.bin.decrypted if original name cannot be restored)
+./therapist decrypt input.pdf.encrypted "my passphrase"
+# -> input.pdf (restored from embedded metadata)
 ```
 
-Interactive mode (menu, message mode):
+### Interactive mode
 
 ```bash
 ./therapist
 ```
 
-Interactive menu includes: encrypt, decrypt, and a message mode that stores short timestamped encrypted messages as files named `file_<timestamp>` next to the executable.
+Menu options:
+1. **Encrypt a file** - prompts for path, passphrase, optional output name
 
-Behavior notes:
-- Invoking with two arguments treats the first as an input path and the second as the passphrase (encrypt).
-- Invoking with `decrypt <path> <pass>` performs decryption.
+![image](https://github.com/ytaxx/TherapistEncrypter/blob/v0.2.0/img/5.png)
 
-## File format (V5)
+2. **Decrypt a file** - prompts for path, passphrase; restores original filename
 
-- Header magic: 4 bytes `{'T','P','C','5'}`
-- Version: 1 byte (5)
-- Salt length: 1 byte (32)
-- MAC length: 1 byte (32)
-- Layout: `[salt1 (32)] [salt2 (32)] [mac (32)] [ciphertext (N)]`
+![image](https://github.com/ytaxx/TherapistEncrypter/blob/v0.2.0/img/6.png)
 
-V4 (legacy) blobs are still accepted for decryption.
+3. **Write an encrypted message** - encrypts a typed message to a timestamped file
 
-## Implementation highlights & where to look
+![image](https://github.com/ytaxx/TherapistEncrypter/blob/v0.2.0/img/3.png)
 
-- Source: [main.cpp](main.cpp)
-- Key functions/types:
-  - `deriveHardenedSchedule` -- memory-hard KDF (V5)
-  - `encryptPayloadV5` / `decryptPayloadV5` -- in-memory double-pass flows
-  - `encryptFileStreamToFile` / `decryptFileStreamToFile` -- streaming file-mode flows (64 KiB chunks)
-  - `applyEnhancedCipher` / `applyEnhancedCipherChunk` -- CTR-style streaming cipher
-  - `computeHardenedMac`, `macInit`, `macFeedBuffer`, `macFinalize` -- incremental MAC helpers
-  - `SBoxPair::fwd64` and `applySBoxToWord` -- precomputed 64-bit S-box lane tables
+4. **Read an encrypted message** - lists available message files, decrypts and displays with typewriter animation
 
-## Security notes & threat model
+![image](https://github.com/ytaxx/TherapistEncrypter/blob/v0.2.0/img/4.png)
 
-- The implementation is designed for local file encryption with a focus on auditability and hardening via an expensive KDF. It is self-contained but implements custom primitives -- for high-assurance projects, prefer using vetted AEAD libraries (e.g., libsodium or OpenSSL) or subject this implementation to independent review.
-- Default KDF parameters are intentionally expensive: 1 MiB memory and 131,072 iterations (compile-time constants in `main.cpp`). Adjust them in source if you need a different performance/security trade-off.
-- The MAC covers the original plaintext; decryption verifies the MAC in constant time. On Windows the program performs optional anti-debug checks; these are defense-in-depth and not a substitute for secure runtime environments.
+5. **Run self-test** - runs all 16 built-in tests
 
-## Roadmap / TODO (high-impact items)
+![image](https://github.com/ytaxx/TherapistEncrypter/blob/v0.2.0/img/2.png)
 
-- Vectorize / widen MAC computation (word-wise or SIMD). (not started)
-- Align and prefetch KDF memory; consider `mlock`/platform APIs to reduce swapping. (not started)
-- Expose KDF parameters via CLI/env for easier tuning. (not started)
-- Add microbench harness and profiling hooks; enable PGO workflow. (not started)
-- Add unit tests and CI including format tests and basic fuzzing. (not started)
-- Consider optional SIMD S-box (AVX2/NEON) fallback for heavy CPU workloads. (not started)
+### CLI options
 
-If you'd like, I can implement the top-priority item (parallel CTR segmentation for multi-core throughput) next or maybe you could help me out with it.
+| Option | Description |
+|---|---|
+| `--self-test` | Run comprehensive self-test and exit |
+| `--kdf-iterations=N` | Override KDF iteration count |
+| `--kdf-memory=SIZE` | Override KDF memory (e.g., `2M`, `512K`) |
+
+Environment variables `THERAPIST_KDF_ITERATIONS` and `THERAPIST_KDF_MEMORY_BYTES` also work.
+
+## File format (V6)
+
+```
+[4 bytes: "TPC6"] [version: 6] [salt_len: 32] [mac_len: 32]
+[salt1: 32 bytes] [salt2: 32 bytes] [MAC: 32 bytes]
+[ciphertext]
+```
+
+The ciphertext contains an augmented payload with random chaff, the original filename, date, and the actual file data - all encrypted with the double-pass cipher.
+
+V5 files (`TPC5` header) are still accepted for decryption but lack embedded metadata.
+
+## Key functions
+
+| Function | Purpose |
+|---|---|
+| `deriveHardenedSchedule` | Memory-hard KDF producing round keys + MAC seeds |
+| `encryptPayload` / `decryptPayload` | Full encrypt/decrypt with V6 format |
+| `encryptBlockV5` | 32-round Feistel block cipher |
+| `applyCipher` | Double-pass CTR mode |
+| `computeHardenedMac` | 256-bit cascaded MAC |
+| `buildAugmentedV6` / `parseAugmentedV6` | Chaff + metadata + plaintext packing |
+| `runSelfTest` | Comprehensive 16-test validation suite |
+
+## Security notes
+
+- Custom cipher implementation - designed for auditability and self-containment. For high-assurance use, prefer vetted libraries (libsodium, OpenSSL) or get this reviewed independently.
+- KDF defaults are intentionally expensive (1 MiB, 131K iterations). Adjust via CLI flags if needed.
+- MAC covers original plaintext; verification is constant-time.
+- All key material is securely zeroed via RAII destructors.
+- Passphrase length warning at < 8 characters.
 
 ## Contributing
 
@@ -106,4 +125,4 @@ If you'd like, I can implement the top-priority item (parallel CTR segmentation 
 
 ## License
 
-MIT -- see [LICENSE](LICENSE).
+Apache License 2.0 — see [LICENSE](LICENSE).
