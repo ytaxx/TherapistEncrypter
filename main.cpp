@@ -63,23 +63,6 @@ using WinHttpCloseHandleFn = BOOL (WINAPI*)(HINTERNET);
 #endif
 
 namespace therapist {
-
-// general notes:
-// - most comments are lowercase to keep a consistent style.
-// - avoid capital letters unless they help understanding (for example: CSPRNG, OS).
-// - avoid using emdash characters; use simple hyphen "-" when separating phrases.
-// - this file contains: constants, settings, s-box, primitive helpers, csprng,
-//   secure memory helpers, key schedule, block cipher implementation, ctr mode,
-//   mac computation, payload augmentation/parsing, file i/o, network/version checks,
-//   and console/ui helpers.
-// - when editing cryptographic code, do not change algorithms or constants
-//   without a clear security review and tests. treat the algorithms as sensitive.
-// - memory handling functions try to zero and lock sensitive buffers where possible.
-// - use the existing helper functions (securezero, securewipe, scopedbuffer)
-//   rather than rolling your own buffer handling.
-// - keep comments focused on why and how, not just what; prefer short, clear notes.
-
-
 // ---------------------------------------------------------------------------
 //  types
 // ---------------------------------------------------------------------------
