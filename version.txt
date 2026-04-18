@@ -1,2 +1,2 @@
-0.2.0pre3
+0.2.0pre4
 https://github.com/ytaxx/TherapistEncrypter/releases/
