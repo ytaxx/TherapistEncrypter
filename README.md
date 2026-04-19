@@ -4,7 +4,7 @@ A single-file, self-contained C++17 command-line encryption tool. No external de
 
 See the full implementation in [main.cpp](main.cpp).
 
-![image](https://github.com/ytaxx/TherapistEncrypter/blob/v0.2.0/img/1.png)
+![image](https://github.com/ytaxx/TherapistEncrypter/blob/v0.2.0pre4/img/1.png)
 
 ## Features
 
@@ -59,23 +59,23 @@ Decrypt a file:
 Menu options:
 1. **Encrypt a file** - prompts for path, passphrase, optional output name
 
-![image](https://github.com/ytaxx/TherapistEncrypter/blob/v0.2.0/img/5.png)
+![image](https://github.com/ytaxx/TherapistEncrypter/blob/v0.2.0pre4/img/5.png)
 
 2. **Decrypt a file** - prompts for path, passphrase; restores original filename
 
-![image](https://github.com/ytaxx/TherapistEncrypter/blob/v0.2.0/img/6.png)
+![image](https://github.com/ytaxx/TherapistEncrypter/blob/v0.2.0pre4/img/6.png)
 
 3. **Write an encrypted message** - encrypts a typed message to a timestamped file
 
-![image](https://github.com/ytaxx/TherapistEncrypter/blob/v0.2.0/img/3.png)
+![image](https://github.com/ytaxx/TherapistEncrypter/blob/v0.2.0pre4/img/3.png)
 
 4. **Read an encrypted message** - lists available message files, decrypts and displays with typewriter animation
 
-![image](https://github.com/ytaxx/TherapistEncrypter/blob/v0.2.0/img/4.png)
+![image](https://github.com/ytaxx/TherapistEncrypter/blob/v0.2.0pre4/img/4.png)
 
 5. **Run self-test** - runs all 16 built-in tests
 
-![image](https://github.com/ytaxx/TherapistEncrypter/blob/v0.2.0/img/2.png)
+![image](https://github.com/ytaxx/TherapistEncrypter/blob/v0.2.0pre4/img/2.png)
 
 ### CLI options
 
